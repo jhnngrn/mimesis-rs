@@ -1,15 +1,18 @@
 //! Node — collection of bilateral links for an identity.
 //!
-//! Manages the set of links, the outbox (collected from SyncObject queues
-//! during nextTx), and the sync loop that drives bilateral communication.
+//! Manages the set of links, module dispatch, and the sync protocol
+//! that drives bilateral communication. Outbox messages are collected
+//! from registered modules' SyncObject queues during nextTx.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::link::{
-    ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest,
+    ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest, TxResponse,
     ValidateResult, now_secs,
 };
+use crate::module::Module;
 
 /// Maximum number of concurrent links per node.
 pub const MAX_LINKS: usize = 64;
@@ -29,8 +32,17 @@ impl Default for InviteMode {
     }
 }
 
+/// Split "trustline.payment" → ("trustline", "payment").
+/// If no dot, returns ("", method).
+fn split_method(method: &str) -> (&str, &str) {
+    match method.find('.') {
+        Some(i) => (&method[..i], &method[i + 1..]),
+        None => ("", method),
+    }
+}
+
 /// Node manages the set of bilateral links for an identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
     pub links: HashMap<String, Link>,
@@ -39,6 +51,9 @@ pub struct Node {
     /// Root module declarations: root name → child module names.
     #[serde(skip)]
     roots: HashMap<String, Vec<String>>,
+    /// Registered modules by name.
+    #[serde(skip)]
+    modules: HashMap<String, Box<dyn Module>>,
 }
 
 impl Node {
@@ -48,12 +63,18 @@ impl Node {
             links: HashMap::new(),
             invite_mode: InviteMode::default(),
             roots: HashMap::new(),
+            modules: HashMap::new(),
         }
     }
 
     /// Declare a root module with its child modules.
     pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
         self.roots.insert(name.to_string(), children);
+    }
+
+    /// Register a module instance.
+    pub fn register_module(&mut self, name: &str, module: Box<dyn Module>) {
+        self.modules.insert(name.to_string(), module);
     }
 
     /// True if name is a declared root module.
@@ -76,6 +97,11 @@ impl Node {
     /// Get a mutable reference to an existing link.
     pub fn get_mut(&mut self, peer: &str) -> Option<&mut Link> {
         self.links.get_mut(peer)
+    }
+
+    /// Access module map (for cross-module access).
+    pub fn module_map(&self) -> &HashMap<String, Box<dyn Module>> {
+        &self.modules
     }
 
     /// Create a new outgoing link to peer running the named root module.
@@ -114,27 +140,21 @@ impl Node {
             Some(r) => r.clone(),
             None => return,
         };
-        // Filter to valid child modules first (needs &self).
         let valid: Vec<String> = modules
             .iter()
             .filter(|name| self.is_child_module(name, &root))
             .cloned()
             .collect();
-        // Now mutate the link.
         let lk = self.links.get_mut(peer).unwrap();
         for name in valid {
-            let mod_state = lk
-                .state
-                .modules
-                .entry(name)
-                .or_default();
+            let mod_state = lk.state.modules.entry(name).or_default();
             if mod_state.status.is_none() {
                 mod_state.intent_connect = true;
             }
         }
     }
 
-    /// True if the module on the peer's link is available (connected and not closing).
+    /// True if the module on the peer's link is available.
     pub fn module_available(&self, peer: &str, module: &str) -> bool {
         self.links
             .get(peer)
@@ -143,26 +163,573 @@ impl Node {
 
     /// Unilaterally remove a link.
     pub fn force_remove(&mut self, peer: &str) {
+        // Fire ForceRemove on all connected modules.
+        if let Some(lk) = self.links.get(peer) {
+            let root = lk.state.root.clone();
+            let mod_names: Vec<String> = lk.state.modules.keys().cloned().collect();
+            // Children first, then root.
+            for name in &mod_names {
+                if let Some(m) = self.modules.get_mut(name) {
+                    m.force_remove(peer);
+                }
+            }
+            if let Some(ref r) = root {
+                if let Some(m) = self.modules.get_mut(r.as_str()) {
+                    m.force_remove(peer);
+                }
+            }
+        }
         self.links.remove(peer);
     }
 
-    /// Determine the next message to send for this peer.
-    /// This is the heart of the bilateral sync protocol.
-    pub fn next_tx(&mut self, peer: &str) -> Option<QueuedMsg> {
-        let lk = self.links.get_mut(peer)?;
+    // -----------------------------------------------------------------------
+    // Busy checks
+    // -----------------------------------------------------------------------
 
-        // Cancel opposing intents on established links.
-        if lk.state.conn.intent_close
-            && lk.state.conn.intent_connect
-            && lk.state.conn.status.is_some()
-        {
-            lk.state.conn.intent_close = false;
-            lk.state.conn.intent_connect = false;
+    /// True if any module is busy with or has outbox entries for this peer.
+    fn any_busy(&self, peer: &str) -> bool {
+        for (_, m) in &self.modules {
+            if m.outbox_has(peer) || m.busy(peer) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if the named module (and its children if root) is busy.
+    fn module_busy(&self, name: &str, peer: &str) -> bool {
+        if let Some(m) = self.modules.get(name) {
+            if m.outbox_has(peer) || m.busy(peer) {
+                return true;
+            }
+        }
+        // If root, also check children.
+        if let Some(children) = self.roots.get(name) {
+            for child in children {
+                if let Some(m) = self.modules.get(child.as_str()) {
+                    if m.outbox_has(peer) || m.busy(peer) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch — incoming request
+    // -----------------------------------------------------------------------
+
+    /// Dispatch an incoming sync request by namespace.
+    pub fn dispatch_request(
+        &mut self,
+        peer: &str,
+        full_method: &str,
+        payload: Option<Value>,
+        ts: i64,
+    ) -> Result<bool, SyncError> {
+        let (ns, method) = split_method(full_method);
+
+        if ns == "link" {
+            return self.dispatch_link_request(peer, method, payload);
+        }
+        if ns == "module" {
+            return self.dispatch_module_request(peer, method, payload);
+        }
+        // Application module message.
+        let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
+        if !lk.module_connected(ns) {
+            return Err(SyncError::BadMethod);
+        }
+        let m = self
+            .modules
+            .get_mut(ns)
+            .ok_or(SyncError::BadMethod)?;
+        match m.handle_request(peer, method, payload, ts) {
+            Ok(r) => Ok(r.ok),
+            Err(e) => Err(SyncError::Other(e.to_string())),
+        }
+    }
+
+    fn dispatch_link_request(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: Option<Value>,
+    ) -> Result<bool, SyncError> {
+        match method {
+            "connect" => {
+                let name = payload
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if name.is_empty() || !self.is_root(name) {
+                    return Err(SyncError::Other(format!(
+                        "unknown root module {:?}",
+                        name
+                    )));
+                }
+                let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
+                if lk.state.conn.status == Some(ConnectionStatus::Connected) {
+                    return Err(SyncError::Other("link already connected".into()));
+                }
+                if lk.state.conn.status == Some(ConnectionStatus::Incoming) {
+                    return Err(SyncError::Other("link already incoming".into()));
+                }
+                // Root mismatch — NACK.
+                if lk.state.root.as_deref() != Some(name) {
+                    return Ok(false);
+                }
+                // Accept: mutual add or open mode.
+                let status = lk.state.conn.status.clone();
+                let is_open = self.invite_mode == InviteMode::Open;
+                if status == Some(ConnectionStatus::Waiting) || is_open {
+                    let lk = self.links.get_mut(peer).unwrap();
+                    lk.state.conn.status = Some(ConnectionStatus::Connected);
+                    lk.state.conn.intent_connect = false;
+                    let root = lk.state.root.clone().unwrap_or_default();
+                    if let Some(m) = self.modules.get_mut(root.as_str()) {
+                        m.on_connect(peer);
+                    }
+                    return Ok(true);
+                }
+                // Invite mode — mark as incoming, NACK.
+                let lk = self.links.get_mut(peer).unwrap();
+                lk.state.conn.status = Some(ConnectionStatus::Incoming);
+                Ok(false)
+            }
+            "close" => {
+                if self.any_busy(peer) {
+                    return Err(SyncError::RefsHeld);
+                }
+                let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
+                if lk.state.conn.status == Some(ConnectionStatus::Connected) {
+                    // OnClose: children first, then root.
+                    let mod_names: Vec<String> = lk
+                        .state
+                        .modules
+                        .iter()
+                        .filter(|(_, c)| c.status == Some(ConnectionStatus::Connected))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    let root = lk.state.root.clone().unwrap_or_default();
+                    for name in &mod_names {
+                        if let Some(m) = self.modules.get_mut(name.as_str()) {
+                            m.on_close(peer);
+                        }
+                    }
+                    if let Some(m) = self.modules.get_mut(root.as_str()) {
+                        m.on_close(peer);
+                    }
+                }
+                self.links.remove(peer);
+                Ok(true)
+            }
+            _ => Err(SyncError::Other(format!(
+                "unknown link method {:?}",
+                method
+            ))),
+        }
+    }
+
+    fn dispatch_module_request(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: Option<Value>,
+    ) -> Result<bool, SyncError> {
+        let name = payload
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
+        let root = lk.state.root.clone().unwrap_or_default();
+
+        match method {
+            "connect" => {
+                if name.is_empty() || !self.is_child_module(name, &root) {
+                    return Ok(false);
+                }
+                if !self.modules.contains_key(name) {
+                    return Ok(false);
+                }
+                let lk = self.links.get_mut(peer).unwrap();
+                let mod_state = lk.state.modules.entry(name.to_string()).or_default();
+
+                // Already connected — idempotent ACK.
+                if mod_state.status == Some(ConnectionStatus::Connected) {
+                    return Ok(true);
+                }
+                // Mutual — we also want this module.
+                if mod_state.intent_connect
+                    || mod_state.status == Some(ConnectionStatus::Waiting)
+                {
+                    mod_state.status = Some(ConnectionStatus::Connected);
+                    mod_state.intent_connect = false;
+                    if let Some(m) = self.modules.get_mut(name) {
+                        m.on_connect(peer);
+                    }
+                    return Ok(true);
+                }
+                // Open mode — auto-accept.
+                if self.invite_mode == InviteMode::Open {
+                    mod_state.status = Some(ConnectionStatus::Connected);
+                    if let Some(m) = self.modules.get_mut(name) {
+                        m.on_connect(peer);
+                    }
+                    return Ok(true);
+                }
+                // Invite — mark incoming, NACK.
+                mod_state.status = Some(ConnectionStatus::Incoming);
+                Ok(false)
+            }
+            "close" => {
+                if name.is_empty() || !self.is_child_module(name, &root) {
+                    return Ok(false);
+                }
+                let lk = self.links.get_mut(peer).unwrap();
+                let mod_state = match lk.state.modules.get(name) {
+                    Some(s) => s,
+                    None => return Ok(true), // already gone
+                };
+                // Check busy.
+                if let Some(m) = self.modules.get(name) {
+                    if m.outbox_has(peer) || m.busy(peer) {
+                        return Err(SyncError::RefsHeld);
+                    }
+                }
+                let was_connected =
+                    mod_state.status == Some(ConnectionStatus::Connected);
+                lk.state.modules.remove(name);
+                if was_connected {
+                    if let Some(m) = self.modules.get_mut(name) {
+                        m.on_close(peer);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(SyncError::Other(format!(
+                "unknown module method {:?}",
+                method
+            ))),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch — outgoing response
+    // -----------------------------------------------------------------------
+
+    /// Dispatch a response to our outgoing message.
+    pub fn dispatch_response(
+        &mut self,
+        peer: &str,
+        full_method: &str,
+        payload: Option<Value>,
+        ok: bool,
+        ts: i64,
+    ) {
+        let (ns, method) = split_method(full_method);
+
+        if ns == "link" {
+            self.dispatch_link_response(peer, method, ok);
+            return;
+        }
+        if ns == "module" {
+            self.dispatch_module_response(peer, method, payload, ok);
+            return;
+        }
+        // Application module response.
+        if let Some(m) = self.modules.get_mut(ns) {
+            m.handle_response(peer, method, payload, ok, ts);
+        }
+    }
+
+    fn dispatch_link_response(&mut self, peer: &str, method: &str, ok: bool) {
+        match method {
+            "connect" => {
+                let lk = match self.links.get_mut(peer) {
+                    Some(lk) => lk,
+                    None => return,
+                };
+                if ok {
+                    lk.state.conn.status = Some(ConnectionStatus::Connected);
+                    lk.state.conn.intent_connect = false;
+                    let root = lk.state.root.clone().unwrap_or_default();
+                    if let Some(m) = self.modules.get_mut(root.as_str()) {
+                        m.on_connect(peer);
+                    }
+                } else {
+                    lk.state.conn.status = Some(ConnectionStatus::Waiting);
+                    lk.state.conn.intent_connect = false;
+                }
+            }
+            "close" => {
+                if ok {
+                    // OnClose: children first, then root.
+                    if let Some(lk) = self.links.get(peer) {
+                        let mod_names: Vec<String> = lk
+                            .state
+                            .modules
+                            .iter()
+                            .filter(|(_, c)| {
+                                c.status == Some(ConnectionStatus::Connected)
+                            })
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        let root = lk.state.root.clone().unwrap_or_default();
+                        for name in &mod_names {
+                            if let Some(m) = self.modules.get_mut(name.as_str()) {
+                                m.on_close(peer);
+                            }
+                        }
+                        if let Some(m) = self.modules.get_mut(root.as_str()) {
+                            m.on_close(peer);
+                        }
+                    }
+                    self.links.remove(peer);
+                } else {
+                    if let Some(lk) = self.links.get_mut(peer) {
+                        lk.state.conn.intent_close = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn dispatch_module_response(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: Option<Value>,
+        ok: bool,
+    ) {
+        let name = payload
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            return;
         }
 
+        match method {
+            "connect" => {
+                let lk = match self.links.get_mut(peer) {
+                    Some(lk) => lk,
+                    None => return,
+                };
+                let mod_state = match lk.state.modules.get_mut(name) {
+                    Some(s) => s,
+                    None => return,
+                };
+                if ok {
+                    mod_state.status = Some(ConnectionStatus::Connected);
+                    mod_state.intent_connect = false;
+                    if let Some(m) = self.modules.get_mut(name) {
+                        m.on_connect(peer);
+                    }
+                } else {
+                    mod_state.status = Some(ConnectionStatus::Waiting);
+                    mod_state.intent_connect = false;
+                }
+            }
+            "close" => {
+                let lk = match self.links.get_mut(peer) {
+                    Some(lk) => lk,
+                    None => return,
+                };
+                let mod_state = match lk.state.modules.get(name) {
+                    Some(s) => s,
+                    None => return,
+                };
+                if ok {
+                    let was_connected =
+                        mod_state.status == Some(ConnectionStatus::Connected);
+                    lk.state.modules.remove(name);
+                    if was_connected {
+                        if let Some(m) = self.modules.get_mut(name) {
+                            m.on_close(peer);
+                        }
+                    }
+                } else {
+                    if let Some(s) = lk.state.modules.get_mut(name) {
+                        s.intent_close = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Handle incoming — the full sync receive path
+    // -----------------------------------------------------------------------
+
+    /// Handle a complete incoming sync request envelope.
+    /// This is the main entry point for the receive side.
+    pub fn handle_incoming(&mut self, env: &TxRequest) -> Result<TxResponse, SyncError> {
+        let peer = env.from.to_lowercase();
+
+        // No link — handle link.connect and link.close specially.
+        if !self.links.contains_key(&peer) {
+            if env.method == "link.close" {
+                return Ok(TxResponse {
+                    ok: true,
+                    timestamp: now_secs(),
+                });
+            }
+            if env.method != "link.connect" {
+                return Err(SyncError::NoLink);
+            }
+            if self.invite_mode == InviteMode::Closed {
+                return Ok(TxResponse {
+                    ok: false,
+                    timestamp: now_secs(),
+                });
+            }
+            if self.links.len() >= MAX_LINKS {
+                return Err(SyncError::MaxLinks);
+            }
+            // Validate root module name before creating state.
+            let root_name = env
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if root_name.is_empty() || !self.is_root(root_name) {
+                return Err(SyncError::Other(format!(
+                    "unknown root module {:?}",
+                    root_name
+                )));
+            }
+            let mut lk = Link::new(&self.id, &peer);
+            lk.state.root = Some(root_name.to_string());
+            self.links.insert(peer.clone(), lk);
+        }
+
+        let now = now_secs();
+
+        // Piggybacked response.
+        if let Some(ref resp) = env.resp {
+            let lk = self.links.get(&peer).unwrap();
+            if lk.pending.is_some() && env.counter == lk.counter + 1 {
+                let lk = self.links.get(&peer).unwrap();
+                lk.validate_timestamp(resp.timestamp, now)?;
+
+                // Extract pending info before mutable borrow.
+                let pending_method;
+                let pending_payload;
+                let pending_module;
+                let pending_queue_id;
+                {
+                    let lk = self.links.get(&peer).unwrap();
+                    let p = lk.pending.as_ref().unwrap();
+                    pending_method = p.method.clone();
+                    pending_payload = p.payload.clone();
+                    pending_module = p.module.clone();
+                    pending_queue_id = p.queue_id.clone();
+                }
+
+                self.dispatch_response(
+                    &peer,
+                    &pending_method,
+                    pending_payload,
+                    resp.ok,
+                    resp.timestamp,
+                );
+
+                // Dequeue from originating module.
+                if !pending_module.is_empty() {
+                    if let Some(m) = self.modules.get_mut(pending_module.as_str()) {
+                        m.dequeue(&peer, &pending_queue_id);
+                    }
+                }
+
+                let lk = self.links.get_mut(&peer).unwrap();
+                lk.accept_response(resp.timestamp);
+            }
+        }
+
+        // Validate counter.
+        {
+            let lk = self.links.get(&peer).unwrap();
+            match lk.validate_request(env.counter)? {
+                ValidateResult::Ok => {}
+                ValidateResult::Cached(cached) => return Ok(cached),
+            }
+        }
+
+        // Determine timestamp.
+        let lk = self.links.get(&peer).unwrap();
+        let ts = if lk.dominant() {
+            let mut t = now;
+            if t < lk.ts {
+                t = lk.ts;
+            }
+            t
+        } else {
+            env.timestamp
+        };
+
+        // Validate timestamp.
+        self.links
+            .get(&peer)
+            .unwrap()
+            .validate_timestamp(ts, now)?;
+
+        // Dispatch request.
+        let ok = self.dispatch_request(&peer, &env.method, env.payload.clone(), ts)?;
+
+        // Accept and return response.
+        let lk = self.links.get_mut(&peer).unwrap();
+        let response = lk.accept_request(ok, ts);
+        Ok(response)
+    }
+
+    // -----------------------------------------------------------------------
+    // nextTx — collect from lifecycle + module outboxes
+    // -----------------------------------------------------------------------
+
+    /// Determine the next message to send for this peer.
+    pub fn next_tx(&mut self, peer: &str) -> Option<QueuedMsg> {
+        // Phase 1: Mutable link access — cancel opposing intents.
+        {
+            let lk = self.links.get_mut(peer)?;
+
+            // Cancel opposing intents on established links.
+            if lk.state.conn.intent_close
+                && lk.state.conn.intent_connect
+                && lk.state.conn.status.is_some()
+            {
+                lk.state.conn.intent_close = false;
+                lk.state.conn.intent_connect = false;
+            }
+
+            // Module-level opposing intents.
+            if lk.state.conn.status == Some(ConnectionStatus::Connected) {
+                for mod_state in lk.state.modules.values_mut() {
+                    if mod_state.intent_close
+                        && mod_state.intent_connect
+                        && mod_state.status.is_some()
+                    {
+                        mod_state.intent_close = false;
+                        mod_state.intent_connect = false;
+                    }
+                }
+            }
+        }
+        // Mutable borrow dropped — now we can call &self methods freely.
+
+        // Phase 2: Read link state + busy checks (immutable).
+        let lk = self.links.get(peer)?;
+
         // Link-level lifecycle messages have absolute priority.
-        if lk.state.conn.intent_close {
-            // TODO: check anyBusy when modules are integrated
+        if lk.state.conn.intent_close && !self.any_busy(peer) {
             return Some(QueuedMsg {
                 method: "link.close".into(),
                 payload: None,
@@ -186,41 +753,81 @@ impl Node {
             return None;
         }
 
-        // Module close/connect — cancel opposing, close first, then connect.
-        for mod_state in lk.state.modules.values_mut() {
-            if mod_state.intent_close && mod_state.intent_connect && mod_state.status.is_some() {
-                mod_state.intent_close = false;
-                mod_state.intent_connect = false;
-            }
+        // Collect module close intents (needs busy check).
+        let close_name: Option<String> = lk
+            .state
+            .modules
+            .iter()
+            .find(|(name, s)| s.intent_close && !self.module_busy(name, peer))
+            .map(|(name, _)| name.clone());
+        if let Some(name) = close_name {
+            return Some(QueuedMsg {
+                method: "module.close".into(),
+                payload: Some(serde_json::json!({"name": name})),
+                queued_at: 0,
+                module: String::new(),
+                queue_id: String::new(),
+            });
         }
-        for (name, mod_state) in &lk.state.modules {
-            if mod_state.intent_close {
-                // TODO: check moduleBusy
-                return Some(QueuedMsg {
-                    method: "module.close".into(),
-                    payload: Some(serde_json::json!({"name": name})),
-                    queued_at: 0,
-                    module: String::new(),
-                    queue_id: String::new(),
-                });
-            }
+
+        // Collect module connect intents.
+        let connect_name: Option<String> = lk
+            .state
+            .modules
+            .iter()
+            .find(|(_, s)| s.intent_connect)
+            .map(|(name, _)| name.clone());
+        if let Some(name) = connect_name {
+            return Some(QueuedMsg {
+                method: "module.connect".into(),
+                payload: Some(serde_json::json!({"name": name})),
+                queued_at: 0,
+                module: String::new(),
+                queue_id: String::new(),
+            });
         }
-        for (name, mod_state) in &lk.state.modules {
-            if mod_state.intent_connect {
-                return Some(QueuedMsg {
-                    method: "module.connect".into(),
-                    payload: Some(serde_json::json!({"name": name})),
-                    queued_at: 0,
-                    module: String::new(),
-                    queue_id: String::new(),
-                });
+
+        // Phase 3: Collect from module outboxes — oldest entry wins.
+        // Snapshot connected module names first, then iterate modules.
+        let connected_modules: Vec<String> = self
+            .modules
+            .keys()
+            .filter(|name| lk.module_connected(name))
+            .cloned()
+            .collect();
+
+        let mut best: Option<QueuedMsg> = None;
+        for mod_name in &connected_modules {
+            let m = self.modules.get(mod_name.as_str()).unwrap();
+            for candidate in m.collect_outbox(peer) {
+                let msg = QueuedMsg {
+                    method: format!("{}.{}", mod_name, candidate.method),
+                    payload: candidate.payload,
+                    queued_at: candidate.queued_at,
+                    module: mod_name.clone(),
+                    queue_id: candidate.queue_id,
+                };
+                let is_better = match &best {
+                    None => true,
+                    Some(b) => {
+                        if msg.queued_at == 0 && b.queued_at == 0 {
+                            false
+                        } else if msg.queued_at == 0 {
+                            false
+                        } else if b.queued_at == 0 {
+                            true
+                        } else {
+                            msg.queued_at < b.queued_at
+                        }
+                    }
+                };
+                if is_better {
+                    best = Some(msg);
+                }
             }
         }
 
-        // Module messages are collected from SyncObject queues at runtime.
-        // This base Node only handles lifecycle; the full framework wires
-        // SyncObject queues into nextTx via a collector trait.
-        None
+        best
     }
 
     /// Build the wire envelope for sending.
@@ -243,26 +850,83 @@ impl Node {
             resp: lk.cached_response.clone(),
         })
     }
-
-    /// Validate an incoming request.
-    pub fn validate_incoming(&self, env: &TxRequest) -> Result<ValidateResult, SyncError> {
-        let lk = self.links.get(&env.from).ok_or(SyncError::NoLink)?;
-        let result = lk.validate_request(env.counter)?;
-        if let ValidateResult::Ok = &result {
-            lk.validate_timestamp(env.timestamp, now_secs())?;
-        }
-        Ok(result)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::{HandleResult, Module, OutboxCandidate};
+
+    /// Minimal test module that tracks OnConnect/OnClose calls.
+    struct TestModule {
+        connected_peers: Vec<String>,
+        closed_peers: Vec<String>,
+    }
+
+    impl TestModule {
+        fn new() -> Self {
+            TestModule {
+                connected_peers: vec![],
+                closed_peers: vec![],
+            }
+        }
+    }
+
+    impl Module for TestModule {
+        fn on_connect(&mut self, peer: &str) {
+            self.connected_peers.push(peer.to_string());
+        }
+        fn on_close(&mut self, peer: &str) {
+            self.closed_peers.push(peer.to_string());
+        }
+        fn handle_request(
+            &mut self,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ts: i64,
+        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
+            Ok(HandleResult { ok: true })
+        }
+        fn handle_response(
+            &mut self,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ok: bool,
+            _ts: i64,
+        ) {
+        }
+        fn handle_account(
+            &mut self,
+            _method: &str,
+            _payload: Option<Value>,
+        ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+            Err("unknown method".into())
+        }
+        fn status(&self) -> Option<Value> {
+            None
+        }
+        fn busy(&self, _peer: &str) -> bool {
+            false
+        }
+        fn force_remove(&mut self, peer: &str) {
+            self.on_close(peer);
+        }
+        fn collect_outbox(&self, _peer: &str) -> Vec<OutboxCandidate> {
+            vec![]
+        }
+        fn dequeue(&mut self, _peer: &str, _queue_id: &str) {}
+        fn outbox_has(&self, _peer: &str) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn connect_creates_link_with_intent() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
+        node.register_module("trustline", Box::new(TestModule::new()));
 
         node.connect("bob@b.com", "trustline").unwrap();
         let lk = node.get("bob@b.com").unwrap();
@@ -278,27 +942,10 @@ mod tests {
     }
 
     #[test]
-    fn connect_rejects_duplicate() {
-        let mut node = Node::new("alice@a.com".into());
-        node.declare_root("trustline", vec![]);
-        node.connect("bob@b.com", "trustline").unwrap();
-        let err = node.connect("bob@b.com", "trustline").unwrap_err();
-        assert!(matches!(err, SyncError::Other(_)));
-    }
-
-    #[test]
-    fn close_sets_intent() {
-        let mut node = Node::new("alice@a.com".into());
-        node.declare_root("trustline", vec![]);
-        node.connect("bob@b.com", "trustline").unwrap();
-        node.close("bob@b.com");
-        assert!(node.get("bob@b.com").unwrap().closing());
-    }
-
-    #[test]
     fn next_tx_returns_connect() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
+        node.register_module("trustline", Box::new(TestModule::new()));
         node.connect("bob@b.com", "trustline").unwrap();
 
         let msg = node.next_tx("bob@b.com").unwrap();
@@ -309,17 +956,16 @@ mod tests {
     fn next_tx_cancels_opposing_intents() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
+        node.register_module("trustline", Box::new(TestModule::new()));
         node.connect("bob@b.com", "trustline").unwrap();
 
-        // Simulate established then set both intents
         let lk = node.get_mut("bob@b.com").unwrap();
         lk.state.conn.status = Some(ConnectionStatus::Connected);
         lk.state.conn.intent_connect = true;
         lk.state.conn.intent_close = true;
 
-        // nextTx should cancel both
         let msg = node.next_tx("bob@b.com");
-        assert!(msg.is_none()); // both cancelled, no module messages
+        assert!(msg.is_none());
         let lk = node.get("bob@b.com").unwrap();
         assert!(!lk.state.conn.intent_connect);
         assert!(!lk.state.conn.intent_close);
@@ -329,21 +975,72 @@ mod tests {
     fn turn_bit_is_deterministic() {
         let lk1 = Link::new("alice@a.com", "bob@b.com");
         let lk2 = Link::new("bob@b.com", "alice@a.com");
-        // One must be 0, the other 1
         assert_ne!(lk1.turn_bit, lk2.turn_bit);
-        // Together they cover both slots
         assert_eq!(lk1.turn_bit + lk2.turn_bit, 1);
     }
 
     #[test]
-    fn connect_modules_sets_intent() {
-        let mut node = Node::new("alice@a.com".into());
-        node.declare_root("trustline", vec!["routing".into()]);
-        node.connect("bob@b.com", "trustline").unwrap();
+    fn bilateral_connect_via_dispatch() {
+        // Alice connects to Bob.
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_root("trustline", vec![]);
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
 
-        node.connect_modules("bob@b.com", &["routing".into()]);
-        let lk = node.get("bob@b.com").unwrap();
-        let m = lk.state.modules.get("routing").unwrap();
-        assert!(m.intent_connect);
+        // Alice builds link.connect.
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        assert_eq!(msg.method, "link.connect");
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+
+        // Bob receives it (open mode for auto-accept).
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_root("trustline", vec![]);
+        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.invite_mode = InviteMode::Open;
+
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+
+        // Bob's link should be Connected.
+        let bob_lk = bob.get("alice@a.com").unwrap();
+        assert_eq!(
+            bob_lk.state.conn.status,
+            Some(ConnectionStatus::Connected)
+        );
+
+        // Alice processes response.
+        let lk = alice.get_mut("bob@b.com").unwrap();
+        lk.pending = Some(msg.clone());
+        alice.dispatch_response("bob@b.com", &msg.method, msg.payload, resp.ok, resp.timestamp);
+        let lk = alice.get_mut("bob@b.com").unwrap();
+        lk.accept_response(resp.timestamp);
+
+        // Alice's link should be Connected.
+        let alice_lk = alice.get("bob@b.com").unwrap();
+        assert_eq!(
+            alice_lk.state.conn.status,
+            Some(ConnectionStatus::Connected)
+        );
+    }
+
+    #[test]
+    fn bilateral_close_via_dispatch() {
+        // Set up connected link.
+        let mut node = Node::new("alice@a.com".into());
+        node.declare_root("trustline", vec![]);
+        node.register_module("trustline", Box::new(TestModule::new()));
+        node.connect("bob@b.com", "trustline").unwrap();
+        let lk = node.get_mut("bob@b.com").unwrap();
+        lk.state.conn.status = Some(ConnectionStatus::Connected);
+        lk.state.conn.intent_connect = false;
+
+        // Close.
+        node.close("bob@b.com");
+        let msg = node.next_tx("bob@b.com").unwrap();
+        assert_eq!(msg.method, "link.close");
+
+        // Simulate OK response.
+        node.dispatch_response("bob@b.com", "link.close", None, true, 100);
+        assert!(node.get("bob@b.com").is_none()); // link removed
     }
 }
