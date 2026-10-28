@@ -104,6 +104,11 @@ impl Node {
         &self.modules
     }
 
+    /// Get a mutable reference to a module by name.
+    pub fn module_mut(&mut self, name: &str) -> Option<&mut Box<dyn Module>> {
+        self.modules.get_mut(name)
+    }
+
     /// Create a new outgoing link to peer running the named root module.
     pub fn connect(&mut self, peer: &str, root: &str) -> Result<(), SyncError> {
         if !self.is_root(root) {
