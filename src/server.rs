@@ -256,7 +256,7 @@ impl Server {
     // /p2p/tx
     // -----------------------------------------------------------------------
 
-    async fn handle_tx(&self, req: Request<Incoming>) -> Response<String> {
+    async fn handle_tx(self: &Arc<Self>, req: Request<Incoming>) -> Response<String> {
         let (sig_domain, sig, body) = match read_p2p(req).await {
             Ok(v) => v,
             Err(_) => return http_error(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -282,9 +282,19 @@ impl Server {
         }
 
         // Handle incoming.
-        let mut n = node.lock().unwrap();
-        match n.handle_incoming(&env) {
-            Ok(resp) => json_response(StatusCode::OK, &resp),
+        let result = {
+            let mut n = node.lock().unwrap();
+            n.handle_incoming(&env)
+        };
+
+        match result {
+            Ok(resp) => {
+                // Persist and flush outgoing.
+                let user = parse_identity(&env.to).map(|(u, _)| u).unwrap_or_default();
+                let _ = self.commit_node(&env.to);
+                self.flush_user(&user);
+                json_response(StatusCode::OK, &resp)
+            }
             Err(e) => match e {
                 SyncError::NoLink => http_error(StatusCode::NOT_FOUND, "no link"),
                 SyncError::MaxLinks => http_error(StatusCode::BAD_REQUEST, "max links"),
@@ -483,7 +493,7 @@ impl Server {
     // /api/account
     // -----------------------------------------------------------------------
 
-    async fn handle_account(&self, req: Request<Incoming>) -> Response<String> {
+    async fn handle_account(self: &Arc<Self>, req: Request<Incoming>) -> Response<String> {
         let api_req = match read_api_request(req).await {
             Ok(r) => r,
             Err(_) => return http_error(StatusCode::BAD_REQUEST, "expected JSON {method, payload}"),
@@ -505,66 +515,75 @@ impl Server {
 
         // "connect", "close", "status", "links" are node-level.
         // "<module>.<method>" dispatches to module.handle_account.
-        let mut n = node.lock().unwrap();
-        match method.as_str() {
-            "connect" => {
-                #[derive(Deserialize)]
-                struct P { peer: String, root: String }
-                let p: P = match payload.and_then(|v| serde_json::from_value(v).ok()) {
-                    Some(p) => p,
-                    None => return api_error("bad payload"),
-                };
-                match n.connect(&p.peer, &p.root) {
-                    Ok(()) => api_ok(&serde_json::json!(true)),
-                    Err(e) => api_error(&e.to_string()),
+        let resp = {
+            let mut n = node.lock().unwrap();
+            match method.as_str() {
+                "connect" => {
+                    #[derive(Deserialize)]
+                    struct P { peer: String, root: String }
+                    let p: P = match payload.and_then(|v| serde_json::from_value(v).ok()) {
+                        Some(p) => p,
+                        None => return api_error("bad payload"),
+                    };
+                    match n.connect(&p.peer, &p.root) {
+                        Ok(()) => api_ok(&serde_json::json!(true)),
+                        Err(e) => api_error(&e.to_string()),
+                    }
                 }
-            }
-            "close" => {
-                #[derive(Deserialize)]
-                struct P { peer: String }
-                let p: P = match payload.and_then(|v| serde_json::from_value(v).ok()) {
-                    Some(p) => p,
-                    None => return api_error("bad payload"),
-                };
-                n.close(&p.peer);
-                api_ok(&serde_json::json!(true))
-            }
-            "force_remove" => {
-                #[derive(Deserialize)]
-                struct P { peer: String }
-                let p: P = match payload.and_then(|v| serde_json::from_value(v).ok()) {
-                    Some(p) => p,
-                    None => return api_error("bad payload"),
-                };
-                n.force_remove(&p.peer);
-                api_ok(&serde_json::json!(true))
-            }
-            "links" => {
-                let links: HashMap<String, Value> = n
-                    .links
-                    .iter()
-                    .map(|(peer, lk)| (peer.clone(), serde_json::to_value(lk).unwrap_or_default()))
-                    .collect();
-                api_ok(&serde_json::json!(links))
-            }
-            _ => {
-                // Try module dispatch: "trustline.balance" → module "trustline", method "balance".
-                if let Some(dot) = method.find('.') {
-                    let (mod_name, mod_method) = (&method[..dot], &method[dot + 1..]);
-                    if let Some(m) = n.module_mut(mod_name) {
-                        match m.handle_account(mod_method, payload) {
-                            Ok(Some(result)) => api_ok(&result),
-                            Ok(None) => api_ok(&serde_json::json!(true)),
-                            Err(e) => api_error(&e.to_string()),
+                "close" => {
+                    #[derive(Deserialize)]
+                    struct P { peer: String }
+                    let p: P = match payload.and_then(|v| serde_json::from_value(v).ok()) {
+                        Some(p) => p,
+                        None => return api_error("bad payload"),
+                    };
+                    n.close(&p.peer);
+                    api_ok(&serde_json::json!(true))
+                }
+                "force_remove" => {
+                    #[derive(Deserialize)]
+                    struct P { peer: String }
+                    let p: P = match payload.and_then(|v| serde_json::from_value(v).ok()) {
+                        Some(p) => p,
+                        None => return api_error("bad payload"),
+                    };
+                    n.force_remove(&p.peer);
+                    api_ok(&serde_json::json!(true))
+                }
+                "links" => {
+                    let links: HashMap<String, Value> = n
+                        .links
+                        .iter()
+                        .map(|(peer, lk)| (peer.clone(), serde_json::to_value(lk).unwrap_or_default()))
+                        .collect();
+                    api_ok(&serde_json::json!(links))
+                }
+                _ => {
+                    // Try module dispatch: "trustline.balance" → module "trustline", method "balance".
+                    if let Some(dot) = method.find('.') {
+                        let (mod_name, mod_method) = (&method[..dot], &method[dot + 1..]);
+                        if let Some(m) = n.module_mut(mod_name) {
+                            match m.handle_account(mod_method, payload) {
+                                Ok(Some(result)) => api_ok(&result),
+                                Ok(None) => api_ok(&serde_json::json!(true)),
+                                Err(e) => api_error(&e.to_string()),
+                            }
+                        } else {
+                            api_error("unknown module")
                         }
                     } else {
-                        api_error("unknown module")
+                        api_error("unknown method")
                     }
-                } else {
-                    api_error("unknown method")
                 }
             }
-        }
+        };
+
+        // Persist and flush outgoing after every account action.
+        let node_id = format!("{}@{}", sess_user, self.cfg.domain);
+        let _ = self.commit_node(&node_id);
+        self.flush_user(&sess_user);
+
+        resp
     }
 
     // -----------------------------------------------------------------------
@@ -665,6 +684,151 @@ impl Server {
         }
         let tx_resp: TxResponse = resp.json().await?;
         Ok(tx_resp)
+    }
+
+    // -----------------------------------------------------------------------
+    // Send loop — event-driven flush (matches Go sendPending)
+    // -----------------------------------------------------------------------
+
+    /// Send all pending messages for a specific peer on a node.
+    /// Loops: next_tx → build envelope → post → process response → repeat.
+    async fn send_pending(self: &Arc<Self>, node: Arc<Mutex<Node>>, peer: String) {
+        use crate::link::now_secs;
+
+        loop {
+            // Phase 1: Lock, get next message, build envelope, unlock.
+            let (env, msg_module, msg_queue_id) = {
+                let mut n = node.lock().unwrap();
+                let msg = match n.next_tx(&peer) {
+                    Some(m) => m,
+                    None => return, // Nothing to send.
+                };
+
+                let lk = match n.links.get(&peer) {
+                    Some(lk) => lk,
+                    None => return,
+                };
+
+                let mut env = TxRequest {
+                    from: n.id.clone(),
+                    to: peer.clone(),
+                    counter: lk.counter,
+                    method: msg.method.clone(),
+                    payload: msg.payload.clone(),
+                    timestamp: 0,
+                    resp: None,
+                };
+
+                // Dominant side sets timestamp.
+                if lk.dominant() {
+                    env.timestamp = now_secs();
+                    if env.timestamp < lk.ts {
+                        env.timestamp = lk.ts;
+                    }
+                }
+
+                // Piggyback cached response.
+                if let Some(ref cr) = lk.cached_response {
+                    env.resp = Some(cr.clone());
+                }
+
+                let mod_name = msg.module.clone();
+                let q_id = msg.queue_id.clone();
+
+                // Promote to pending.
+                if let Some(lk) = n.links.get_mut(&peer) {
+                    lk.pending = Some(msg);
+                }
+
+                // Persist after promoting.
+                let node_id = n.id.clone();
+                drop(n);
+                let _ = self.commit_node(&node_id);
+
+                (env, mod_name, q_id)
+            };
+
+            // Phase 2: Send to peer (no lock held).
+            let peer_dom = crate::identity::peer_domain(&peer);
+            let resp = match self.send_to_peer(peer_dom, &env).await {
+                Ok(r) => r,
+                Err(e) => {
+                    if self.cfg.verbose {
+                        eprintln!("[send] {}→{} {}: {}", env.from, peer, env.method, e);
+                    }
+                    // On error, clear pending and return (Go has retry timer; we stop for now).
+                    return;
+                }
+            };
+
+            // Phase 3: Lock, process response, dequeue, accept, continue loop.
+            {
+                let mut n = node.lock().unwrap();
+
+                // Validate link still exists and pending matches.
+                let counter_match = n
+                    .links
+                    .get(&peer)
+                    .map(|lk| lk.counter == env.counter && lk.pending.is_some())
+                    .unwrap_or(false);
+                if !counter_match {
+                    return; // Link changed while we were sending.
+                }
+
+                // Validate response timestamp.
+                if let Some(lk) = n.links.get(&peer) {
+                    if lk.validate_timestamp(resp.timestamp, now_secs()).is_err() {
+                        if self.cfg.verbose {
+                            eprintln!("[send] {}→{}: bad response timestamp", n.id, peer);
+                        }
+                        return;
+                    }
+                }
+
+                // Dispatch response.
+                n.dispatch_response(&peer, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
+
+                // Dequeue from module outbox.
+                if !msg_module.is_empty() {
+                    if let Some(m) = n.module_mut(&msg_module) {
+                        m.dequeue(&peer, &msg_queue_id);
+                    }
+                }
+
+                // Accept response (increments counter, clears pending/cached_response).
+                if let Some(lk) = n.links.get_mut(&peer) {
+                    lk.accept_response(resp.timestamp);
+                }
+
+                // Persist.
+                let node_id = n.id.clone();
+                drop(n);
+                let _ = self.commit_node(&node_id);
+            }
+            // Loop back to check for more messages.
+        }
+    }
+
+    /// Flush all peers for a node — spawn a send_pending task per peer.
+    fn flush_node(self: &Arc<Self>, node: Arc<Mutex<Node>>) {
+        let peers: Vec<String> = {
+            let n = node.lock().unwrap();
+            n.links.keys().cloned().collect()
+        };
+        for peer in peers {
+            let srv = Arc::clone(self);
+            let nd = Arc::clone(&node);
+            tokio::spawn(async move {
+                srv.send_pending(nd, peer).await;
+            });
+        }
+    }
+
+    /// Flush a node by username — convenience for handlers.
+    fn flush_user(self: &Arc<Self>, username: &str) {
+        if let Some(node) = self.get_node(username) {
+            self.flush_node(node);
+        }
     }
 
     // -----------------------------------------------------------------------
