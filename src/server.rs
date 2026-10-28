@@ -831,6 +831,14 @@ impl Server {
         }
     }
 
+    /// Flush all nodes — resume pending work at boot (matches Go kickAll).
+    pub fn flush_all(self: &Arc<Self>) {
+        let nodes = self.nodes.read().unwrap();
+        for (_, node) in nodes.iter() {
+            self.flush_node(Arc::clone(node));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // User management
     // -----------------------------------------------------------------------
