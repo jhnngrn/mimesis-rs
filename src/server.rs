@@ -78,6 +78,7 @@ const SIG_PREFIX: &str = "P2PTX1\n";
 const MAX_BODY: usize = 1 << 20;
 const MAX_KEY_CACHE: usize = 256;
 const MAX_USERS: usize = 1000;
+const RETRY_DELAY: Duration = Duration::from_secs(60);
 
 fn signable(path: &str, body: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(SIG_PREFIX.len() + path.len() + 1 + body.len());
@@ -692,7 +693,7 @@ impl Server {
 
     /// Send all pending messages for a specific peer on a node.
     /// Loops: next_tx → build envelope → post → process response → repeat.
-    async fn send_pending(self: &Arc<Self>, node: Arc<Mutex<Node>>, peer: String) {
+    async fn send_pending(self: Arc<Self>, node: Arc<Mutex<Node>>, peer: String) {
         use crate::link::now_secs;
 
         loop {
@@ -750,19 +751,29 @@ impl Server {
 
             // Phase 2: Send to peer (no lock held).
             let peer_dom = crate::identity::peer_domain(&peer);
-            let resp = match self.send_to_peer(peer_dom, &env).await {
-                Ok(r) => r,
-                Err(e) => {
-                    if self.cfg.verbose {
-                        eprintln!("[send] {}→{} {}: {}", env.from, peer, env.method, e);
+            let resp = {
+                let result = self.send_to_peer(peer_dom, &env).await;
+                match result {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        if self.cfg.verbose {
+                            eprintln!("[send] {}→{} {}: {}", env.from, peer, env.method, e);
+                        }
+                        None
                     }
-                    // On error, clear pending and return (Go has retry timer; we stop for now).
-                    return;
+                }
+            }; // `e` dropped here.
+            let resp = match resp {
+                Some(r) => r,
+                None => {
+                    // Retry after delay (matches Go retryDelay = 60s).
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
                 }
             };
 
             // Phase 3: Lock, process response, dequeue, accept, continue loop.
-            {
+            let need_retry = {
                 let mut n = node.lock().unwrap();
 
                 // Validate link still exists and pending matches.
@@ -776,34 +787,42 @@ impl Server {
                 }
 
                 // Validate response timestamp.
-                if let Some(lk) = n.links.get(&peer) {
-                    if lk.validate_timestamp(resp.timestamp, now_secs()).is_err() {
-                        if self.cfg.verbose {
-                            eprintln!("[send] {}→{}: bad response timestamp", n.id, peer);
+                let bad_ts = n.links.get(&peer)
+                    .map(|lk| lk.validate_timestamp(resp.timestamp, now_secs()).is_err())
+                    .unwrap_or(false);
+                if bad_ts {
+                    if self.cfg.verbose {
+                        eprintln!("[send] {}→{}: bad response timestamp", n.id, peer);
+                    }
+                    true // need retry
+                } else {
+                    // Dispatch response.
+                    n.dispatch_response(&peer, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
+
+                    // Dequeue from module outbox.
+                    if !msg_module.is_empty() {
+                        if let Some(m) = n.module_mut(&msg_module) {
+                            m.dequeue(&peer, &msg_queue_id);
                         }
-                        return;
                     }
-                }
 
-                // Dispatch response.
-                n.dispatch_response(&peer, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
-
-                // Dequeue from module outbox.
-                if !msg_module.is_empty() {
-                    if let Some(m) = n.module_mut(&msg_module) {
-                        m.dequeue(&peer, &msg_queue_id);
+                    // Accept response (increments counter, clears pending/cached_response).
+                    if let Some(lk) = n.links.get_mut(&peer) {
+                        lk.accept_response(resp.timestamp);
                     }
-                }
 
-                // Accept response (increments counter, clears pending/cached_response).
-                if let Some(lk) = n.links.get_mut(&peer) {
-                    lk.accept_response(resp.timestamp);
-                }
+                    // Persist.
+                    let node_id = n.id.clone();
+                    drop(n);
+                    let _ = self.commit_node(&node_id);
 
-                // Persist.
-                let node_id = n.id.clone();
-                drop(n);
-                let _ = self.commit_node(&node_id);
+                    false // no retry needed
+                }
+            }; // MutexGuard dropped here, before any await.
+
+            if need_retry {
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
             }
             // Loop back to check for more messages.
         }
