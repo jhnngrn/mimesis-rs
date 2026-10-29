@@ -662,7 +662,7 @@ impl Node {
 
                 // Dequeue from registry.
                 if pending_queue_id != 0 {
-                    self.registry.lock().unwrap().dequeue(pending_queue_id, &peer);
+                    self.registry.lock().unwrap().dequeue(pending_queue_id);
                 }
 
                 let lk = self.links.get_mut(&peer).unwrap();

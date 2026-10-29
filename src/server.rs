@@ -802,7 +802,7 @@ impl Server {
                     // Dequeue from registry.
                     if msg_queue_id != 0 {
                         let reg = n.registry();
-                        reg.lock().unwrap().dequeue(msg_queue_id, &peer);
+                        reg.lock().unwrap().dequeue(msg_queue_id);
                     }
 
                     // Accept response (increments counter, clears pending/cached_response).

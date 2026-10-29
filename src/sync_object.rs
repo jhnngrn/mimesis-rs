@@ -25,6 +25,8 @@ use crate::registry::RegistryRef;
 pub struct SyncObject<T> {
     /// The module's own data.
     pub data: T,
+    /// The peer this SyncObject is bound to (1:1).
+    peer: String,
     /// Internal queue ID assigned by the registry.
     queue_id: u64,
     /// Shared reference to the registry.
@@ -32,38 +34,45 @@ pub struct SyncObject<T> {
 }
 
 impl<T> SyncObject<T> {
-    /// Create a new SyncObject, registering a queue in the registry.
-    pub fn new(data: T, registry: &RegistryRef, module: &str) -> Self {
-        let queue_id = registry.lock().unwrap().register(module);
+    /// Create a new SyncObject bound to a peer, registering a queue in the registry.
+    pub fn new(data: T, peer: &str, registry: &RegistryRef, module: &str) -> Self {
+        let queue_id = registry.lock().unwrap().register(peer, module);
         SyncObject {
             data,
+            peer: peer.to_string(),
             queue_id,
             registry: Some(registry.clone()),
         }
     }
 
     /// Create a SyncObject without a registry (for testing).
-    pub fn without_registry(data: T) -> Self {
+    pub fn without_registry(data: T, peer: &str) -> Self {
         SyncObject {
             data,
+            peer: peer.to_string(),
             queue_id: 0,
             registry: None,
         }
     }
 
-    /// Enqueue a message for a peer. The registry tracks the kick.
-    pub fn send(&self, peer: &str, method: &str, payload: Option<serde_json::Value>) {
+    /// The peer this SyncObject is bound to.
+    pub fn peer(&self) -> &str {
+        &self.peer
+    }
+
+    /// Enqueue a message to this object's peer.
+    pub fn send(&self, method: &str, payload: Option<serde_json::Value>) {
         if let Some(ref reg) = self.registry {
             reg.lock()
                 .unwrap()
-                .enqueue(self.queue_id, peer, method, payload);
+                .enqueue(self.queue_id, method, payload);
         }
     }
 
-    /// Remove all queued entries for a peer on this queue.
-    pub fn delete_queue(&self, peer: &str) {
+    /// Remove all queued entries and unregister this queue.
+    pub fn delete_queue(&self) {
         if let Some(ref reg) = self.registry {
-            reg.lock().unwrap().delete_queue(self.queue_id, peer);
+            reg.lock().unwrap().delete_queue(self.queue_id);
         }
     }
 
@@ -72,11 +81,11 @@ impl<T> SyncObject<T> {
         self.queue_id
     }
 
-    /// True if there's a pending entry for this peer in the registry.
-    pub fn has_pending(&self, peer: &str) -> bool {
+    /// True if the outbox has pending entries for this sync object.
+    pub fn has_pending(&self) -> bool {
         if let Some(ref reg) = self.registry {
             let r = reg.lock().unwrap();
-            r.queue_has_pending(self.queue_id, peer)
+            r.queue_has_pending(self.queue_id)
         } else {
             false
         }
@@ -85,7 +94,7 @@ impl<T> SyncObject<T> {
     /// Reconnect to a registry after deserialization.
     /// The queue data should already exist in the registry from persisted state.
     pub fn reattach(&mut self, registry: &RegistryRef, module: &str) {
-        registry.lock().unwrap().reattach(self.queue_id, module);
+        registry.lock().unwrap().reattach(self.queue_id, &self.peer, module);
         self.registry = Some(registry.clone());
     }
 }
@@ -116,8 +125,9 @@ impl<T> Drop for SyncObject<T> {
 impl<T: Serialize> Serialize for SyncObject<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("SyncObject", 2)?;
+        let mut s = serializer.serialize_struct("SyncObject", 3)?;
         s.serialize_field("data", &self.data)?;
+        s.serialize_field("peer", &self.peer)?;
         s.serialize_field("queue_id", &self.queue_id)?;
         s.end()
     }
@@ -129,11 +139,14 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
         struct Inner<T> {
             data: T,
             #[serde(default)]
+            peer: String,
+            #[serde(default)]
             queue_id: u64,
         }
         let inner = Inner::<T>::deserialize(deserializer)?;
         Ok(SyncObject {
             data: inner.data,
+            peer: inner.peer,
             queue_id: inner.queue_id,
             registry: None, // restored by reattach()
         })
@@ -151,31 +164,30 @@ mod tests {
         struct MyData {
             balance: i64,
         }
-        let obj = SyncObject::without_registry(MyData { balance: 42 });
+        let obj = SyncObject::without_registry(MyData { balance: 42 }, "alice");
         assert_eq!(obj.balance, 42);
     }
 
     #[test]
     fn send_enqueues_in_registry() {
         let reg = registry::new_registry();
-        let obj = SyncObject::new((), &reg, "triad");
+        let obj = SyncObject::new((), "alice", &reg, "triad");
 
-        obj.send("alice", "payment", None);
-        obj.send("bob", "payment", None);
+        obj.send("payment", None);
 
         let r = reg.lock().unwrap();
         assert!(r.has_pending("triad", "alice"));
-        assert!(r.has_pending("triad", "bob"));
-        assert!(!r.has_pending("triad", "carol"));
+        assert!(!r.has_pending("triad", "bob"));
     }
 
     #[test]
     fn send_tracks_kicks() {
         let reg = registry::new_registry();
-        let obj = SyncObject::new((), &reg, "triad");
+        let obj_a = SyncObject::new((), "alice", &reg, "triad");
+        let obj_b = SyncObject::new((), "bob", &reg, "triad");
 
-        obj.send("alice", "x", None);
-        obj.send("bob", "y", None);
+        obj_a.send("x", None);
+        obj_b.send("y", None);
 
         let kicks = reg.lock().unwrap().drain_kicks();
         assert!(kicks.contains("alice"));
@@ -186,7 +198,7 @@ mod tests {
     fn drop_unregisters() {
         let reg = registry::new_registry();
         {
-            let _obj = SyncObject::new((), &reg, "triad");
+            let _obj = SyncObject::new((), "alice", &reg, "triad");
             assert_eq!(reg.lock().unwrap().ref_count("triad"), 1);
         }
         // After drop, ref count is back to 0.
@@ -196,8 +208,8 @@ mod tests {
     #[test]
     fn multiple_sync_objects_track_refs() {
         let reg = registry::new_registry();
-        let obj1 = SyncObject::new((), &reg, "triad");
-        let obj2 = SyncObject::new((), &reg, "triad");
+        let obj1 = SyncObject::new((), "alice", &reg, "triad");
+        let obj2 = SyncObject::new((), "bob", &reg, "triad");
         assert_eq!(reg.lock().unwrap().ref_count("triad"), 2);
 
         drop(obj1);
