@@ -1,8 +1,8 @@
 //! Triad — three-party novation to eliminate circular debt.
 //!
 //! A fully functional module (not a demo), meant to be simple.
-//! Uses SyncObject<TriadData> so Drop guarantees cleanup of
-//! per-peer outbox queues.
+//! Each Novation is its own SyncObject — Drop guarantees cleanup
+//! of that novation's per-peer outbox queues when it's removed.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,13 +34,6 @@ pub struct Novation {
 
 fn is_false(v: &bool) -> bool {
     !*v
-}
-
-/// Persistent data wrapped by SyncObject.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TriadData {
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub novations: HashMap<String, Novation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,9 +81,13 @@ pub type ConnectedPeersFn = Box<dyn Fn() -> Vec<String> + Send + Sync>;
 // Triad module
 // ---------------------------------------------------------------------------
 
-/// Triad implements Module using SyncObject for automatic queue management.
+/// Triad implements Module. Each novation is its own SyncObject<Novation>,
+/// so removing a novation automatically cleans up its queues via Drop.
 pub struct Triad {
-    pub obj: SyncObject<TriadData>,
+    /// Each novation owns its own SyncObject with per-peer queues.
+    pub novations: HashMap<String, SyncObject<Novation>>,
+    /// Kick callback, cloned into each new SyncObject<Novation>.
+    kick: Option<KickFn>,
     pub name: String,
     pub node_id: String,
     bandwidth: Option<BandwidthFn>,
@@ -113,7 +110,8 @@ impl Triad {
         connected_peers: ConnectedPeersFn,
     ) -> Self {
         Triad {
-            obj: SyncObject::new(TriadData::default(), kick),
+            novations: HashMap::new(),
+            kick: Some(kick),
             name,
             node_id,
             bandwidth: Some(bandwidth),
@@ -127,7 +125,8 @@ impl Triad {
     /// Create a minimal Triad for testing (no external deps).
     pub fn for_test(name: &str, node_id: &str) -> Self {
         Triad {
-            obj: SyncObject::without_kick(TriadData::default()),
+            novations: HashMap::new(),
+            kick: None,
             name: name.to_string(),
             node_id: node_id.to_string(),
             bandwidth: None,
@@ -138,14 +137,21 @@ impl Triad {
         }
     }
 
+    /// Insert a new novation, wrapping it in a SyncObject with the kick callback.
+    fn insert_novation(&mut self, id: String, nov: Novation) {
+        let so = match &self.kick {
+            Some(k) => SyncObject::new(nov, std::sync::Arc::clone(k)),
+            None => SyncObject::without_kick(nov),
+        };
+        self.novations.insert(id, so);
+    }
+
     /// How much capacity is reserved by in-flight novations on a peer+side.
     pub fn reserved(&self, peer: &str, side: usize) -> i64 {
-        self.obj
-            .data
-            .novations
+        self.novations
             .values()
-            .filter(|n| n.side[side] == peer)
-            .map(|n| n.amount)
+            .filter(|so| so.data.side[side] == peer)
+            .map(|so| so.data.amount)
             .sum()
     }
 
@@ -169,31 +175,22 @@ impl Triad {
         }
     }
 
-    /// Send a message to a peer via SyncObject queue, using novation_id as queue key.
-    fn send(&mut self, peer: &str, _nov_id: &str, method: &str, payload: Value) {
-        self.obj.send(peer, method, Some(payload));
+    /// Send a message to a peer via the novation's own SyncObject queue.
+    fn send(&mut self, nov_id: &str, peer: &str, method: &str, payload: Value) {
+        if let Some(so) = self.novations.get_mut(nov_id) {
+            so.send(peer, method, Some(payload));
+        }
     }
 
-    /// Clear queued messages for a novation side.
+    /// Clear queued messages for one side of a novation and delete the queue.
     fn remove_side(&mut self, nov_id: &str, side: usize) {
-        let peer = {
-            let nov = match self.obj.data.novations.get(nov_id) {
-                Some(n) => n,
-                None => return,
-            };
-            if nov.side[side].is_empty() {
-                return;
+        if let Some(so) = self.novations.get_mut(nov_id) {
+            let peer = so.data.side[side].clone();
+            if !peer.is_empty() {
+                so.delete_queue(&peer);
+                so.data.side[side] = String::new();
             }
-            nov.side[side].clone()
-        };
-        // Note: SyncObject queues are per-peer, not per-novation.
-        // In Go, api.DeleteQueue(peer, queueID) removes per-queue.
-        // Here we just clear the peer reference. The queue cleanup
-        // happens via SyncObject's Drop or dequeue-on-response.
-        if let Some(nov) = self.obj.data.novations.get_mut(nov_id) {
-            nov.side[side] = String::new();
         }
-        let _ = peer; // used for queue deletion in Go
     }
 
     // -- request handlers --
@@ -212,31 +209,27 @@ impl Triad {
         }
 
         // Confirmation back to initiator — novation already exists.
-        if let Some(nov) = self.obj.data.novations.get(&msg.novation_id) {
-            if !nov.side[IN].is_empty() {
+        if self.novations.contains_key(&msg.novation_id) {
+            let so = self.novations.get(&msg.novation_id).unwrap();
+            if !so.data.side[IN].is_empty() {
                 return Err(format!(
                     "novation {} already confirmed",
                     msg.novation_id
                 )
                 .into());
             }
-            if self.get_pending_balance(peer, IN) < nov.amount {
+            if self.get_pending_balance(peer, IN) < so.data.amount {
                 return Ok(HandleResult { ok: false });
             }
-            let out_peer = nov.side[OUT].clone();
-            let nov = self
-                .obj
-                .data
-                .novations
-                .get_mut(&msg.novation_id)
-                .unwrap();
-            nov.side[IN] = peer.to_string();
+            let out_peer = so.data.side[OUT].clone();
+            let so = self.novations.get_mut(&msg.novation_id).unwrap();
+            so.data.side[IN] = peer.to_string();
             let finalize =
                 serde_json::to_value(FinalizeMsg {
                     novation_id: msg.novation_id.clone(),
                 })
                 .unwrap();
-            self.send(&out_peer, &msg.novation_id, "finalize", finalize);
+            self.send(&msg.novation_id, &out_peer, "finalize", finalize);
             return Ok(HandleResult { ok: true });
         }
 
@@ -244,7 +237,7 @@ impl Triad {
         if msg.next.is_empty() || !self.check_connected(&msg.next) {
             return Ok(HandleResult { ok: false });
         }
-        if self.obj.data.novations.len() >= MAX_NOVATIONS {
+        if self.novations.len() >= MAX_NOVATIONS {
             return Ok(HandleResult { ok: false });
         }
         let bw_in = self.get_bandwidth(peer, IN);
@@ -258,10 +251,7 @@ impl Triad {
             side: [peer.to_string(), String::new()],
             initiator: false,
         };
-        self.obj
-            .data
-            .novations
-            .insert(msg.novation_id.clone(), nov);
+        self.insert_novation(msg.novation_id.clone(), nov);
 
         let next = msg.next.clone();
         let fwd = serde_json::to_value(CommitMsg {
@@ -270,7 +260,7 @@ impl Triad {
             next: peer.to_string(),
         })
         .unwrap();
-        self.send(&next, &msg.novation_id, "commit", fwd);
+        self.send(&msg.novation_id, &next, "commit", fwd);
         Ok(HandleResult { ok: true })
     }
 
@@ -279,24 +269,28 @@ impl Triad {
             Some(m) => m,
             None => return,
         };
-        let nov = match self.obj.data.novations.get_mut(&msg.novation_id) {
-            Some(n) => n,
-            None => return,
-        };
         if !ok {
-            if nov.side[IN].is_empty() {
-                self.obj.data.novations.remove(&msg.novation_id);
+            // Check if IN side is empty before removing.
+            let in_empty = self.novations.get(&msg.novation_id)
+                .map(|so| so.data.side[IN].is_empty())
+                .unwrap_or(true);
+            if in_empty {
+                self.novations.remove(&msg.novation_id); // Drop cleans up queues.
                 return;
             }
-            let in_peer = nov.side[IN].clone();
+            let in_peer = self.novations.get(&msg.novation_id)
+                .map(|so| so.data.side[IN].clone())
+                .unwrap_or_default();
             let rollback = serde_json::to_value(RollbackMsg {
                 novation_id: msg.novation_id.clone(),
             })
             .unwrap();
-            self.send(&in_peer, &msg.novation_id, "rollback", rollback);
+            self.send(&msg.novation_id, &in_peer, "rollback", rollback);
             return;
         }
-        nov.side[OUT] = peer.to_string();
+        if let Some(so) = self.novations.get_mut(&msg.novation_id) {
+            so.data.side[OUT] = peer.to_string();
+        }
     }
 
     fn req_finalize(
@@ -309,15 +303,14 @@ impl Triad {
             Some(v) => serde_json::from_value(v)?,
             None => return Err("bad payload".into()),
         };
-        let nov = match self.obj.data.novations.get(&msg.novation_id) {
-            Some(n) => n,
-            None => return Err(format!("novation {} not found", msg.novation_id).into()),
+        let (amount, out_peer) = {
+            let so = self.novations.get(&msg.novation_id)
+                .ok_or_else(|| format!("novation {} not found", msg.novation_id))?;
+            if so.data.side[IN] != peer {
+                return Err("wrong peer".into());
+            }
+            (so.data.amount, so.data.side[OUT].clone())
         };
-        if nov.side[IN] != peer {
-            return Err("wrong peer".into());
-        }
-        let amount = nov.amount;
-        let out_peer = nov.side[OUT].clone();
 
         self.do_add_balance(peer, amount, ts);
         self.remove_side(&msg.novation_id, IN);
@@ -327,10 +320,10 @@ impl Triad {
                 novation_id: msg.novation_id.clone(),
             })
             .unwrap();
-            self.send(&out_peer, &msg.novation_id, "finalize", fwd);
+            self.send(&msg.novation_id, &out_peer, "finalize", fwd);
         }
         if out_peer.is_empty() {
-            self.obj.data.novations.remove(&msg.novation_id);
+            self.novations.remove(&msg.novation_id); // Drop cleans up.
         }
         Ok(HandleResult { ok: true })
     }
@@ -340,18 +333,19 @@ impl Triad {
             Some(m) => m,
             None => return,
         };
-        let nov = match self.obj.data.novations.get(&msg.novation_id) {
-            Some(n) => n,
-            None => return,
+        let (amount, in_peer) = {
+            let so = match self.novations.get(&msg.novation_id) {
+                Some(so) => so,
+                None => return,
+            };
+            (so.data.amount, so.data.side[IN].clone())
         };
-        let amount = nov.amount;
-        let in_peer = nov.side[IN].clone();
 
         self.do_add_balance(peer, -amount, ts);
         self.remove_side(&msg.novation_id, OUT);
 
         if in_peer.is_empty() {
-            self.obj.data.novations.remove(&msg.novation_id);
+            self.novations.remove(&msg.novation_id); // Drop cleans up.
         }
     }
 
@@ -364,25 +358,25 @@ impl Triad {
             Some(v) => serde_json::from_value(v)?,
             None => return Err("bad payload".into()),
         };
-        let nov = match self.obj.data.novations.get(&msg.novation_id) {
-            Some(n) => n,
-            None => return Err(format!("unknown novation {}", msg.novation_id).into()),
+        let in_peer = {
+            let so = self.novations.get(&msg.novation_id)
+                .ok_or_else(|| format!("unknown novation {}", msg.novation_id))?;
+            if so.data.side[OUT] != peer {
+                return Err("wrong peer".into());
+            }
+            so.data.side[IN].clone()
         };
-        if nov.side[OUT] != peer {
-            return Err("wrong peer".into());
-        }
-        let in_peer = nov.side[IN].clone();
         self.remove_side(&msg.novation_id, OUT);
 
         if in_peer.is_empty() {
-            self.obj.data.novations.remove(&msg.novation_id);
+            self.novations.remove(&msg.novation_id); // Drop cleans up.
             return Ok(HandleResult { ok: true });
         }
         let fwd = serde_json::to_value(RollbackMsg {
             novation_id: msg.novation_id.clone(),
         })
         .unwrap();
-        self.send(&in_peer, &msg.novation_id, "rollback", fwd);
+        self.send(&msg.novation_id, &in_peer, "rollback", fwd);
         Ok(HandleResult { ok: true })
     }
 
@@ -391,7 +385,7 @@ impl Triad {
             Some(m) => m,
             None => return,
         };
-        self.obj.data.novations.remove(&msg.novation_id);
+        self.novations.remove(&msg.novation_id); // Drop cleans up queues.
     }
 
     /// Scan for circular debt and initiate novations (called periodically).
@@ -401,7 +395,7 @@ impl Triad {
             None => return,
         };
         for debtor in &peers {
-            if self.obj.data.novations.len() >= MAX_NOVATIONS {
+            if self.novations.len() >= MAX_NOVATIONS {
                 return;
             }
             let mut avl_d = self.get_pending_balance(debtor, OUT);
@@ -429,14 +423,14 @@ impl Triad {
                     amount,
                     side: [String::new(), debtor.clone()],
                 };
-                self.obj.data.novations.insert(nov_id.clone(), nov);
+                self.insert_novation(nov_id.clone(), nov);
                 let commit = serde_json::to_value(CommitMsg {
                     novation_id: nov_id.clone(),
                     amount,
                     next: creditor.clone(),
                 })
                 .unwrap();
-                self.send(debtor, &nov_id, "commit", commit);
+                self.send(&nov_id, debtor, "commit", commit);
                 avl_d -= amount;
                 if avl_d <= 0 {
                     break;
@@ -501,26 +495,23 @@ impl Module for Triad {
                     Some(v) => serde_json::from_value(v)?,
                     None => return Err("bad payload".into()),
                 };
-                let nov = self
-                    .obj
-                    .data
-                    .novations
-                    .get(&p.novation_id)
-                    .ok_or_else(|| {
-                        format!("unknown novation {}", p.novation_id)
-                    })?;
-                if nov.side[side].is_empty() {
-                    return Err(format!("no peer on {} side", method).into());
-                }
-                let other = if side == OUT { IN } else { OUT };
-                if !nov.side[other].is_empty() {
-                    return Err(format!(
-                        "{}: opposite side still has peer {}",
-                        method, nov.side[other]
-                    )
-                    .into());
-                }
-                let peer = nov.side[side].clone();
+                let (peer, other_empty) = {
+                    let so = self.novations.get(&p.novation_id)
+                        .ok_or_else(|| format!("unknown novation {}", p.novation_id))?;
+                    if so.data.side[side].is_empty() {
+                        return Err(format!("no peer on {} side", method).into());
+                    }
+                    let other = if side == OUT { IN } else { OUT };
+                    if !so.data.side[other].is_empty() {
+                        return Err(format!(
+                            "{}: opposite side still has peer {}",
+                            method, so.data.side[other]
+                        )
+                        .into());
+                    }
+                    (so.data.side[side].clone(), so.data.side[other].is_empty())
+                };
+                let _ = other_empty;
                 let msg_payload = if msg_method == "finalize" {
                     serde_json::to_value(FinalizeMsg {
                         novation_id: p.novation_id.clone(),
@@ -532,7 +523,7 @@ impl Module for Triad {
                     })
                     .unwrap()
                 };
-                self.send(&peer, &p.novation_id, msg_method, msg_payload);
+                self.send(&p.novation_id, &peer, msg_method, msg_payload);
                 Ok(None)
             }
             _ => Err("unknown method".into()),
@@ -541,17 +532,15 @@ impl Module for Triad {
 
     fn status(&self) -> Option<Value> {
         let novs: HashMap<String, Value> = self
-            .obj
-            .data
             .novations
             .iter()
-            .map(|(id, nov)| {
+            .map(|(id, so)| {
                 (
                     id.clone(),
                     serde_json::json!({
-                        "amount": nov.amount,
-                        "in": nov.side[IN],
-                        "out": nov.side[OUT],
+                        "amount": so.data.amount,
+                        "in": so.data.side[IN],
+                        "out": so.data.side[OUT],
                     }),
                 )
             })
@@ -560,77 +549,74 @@ impl Module for Triad {
     }
 
     fn busy(&self, peer: &str) -> bool {
-        self.obj
-            .data
-            .novations
+        self.novations
             .values()
-            .any(|nov| nov.side[IN] == peer || nov.side[OUT] == peer)
+            .any(|so| so.data.side[IN] == peer || so.data.side[OUT] == peer)
     }
 
     fn force_remove(&mut self, peer: &str) {
-        let ids: Vec<String> = self.obj.data.novations.keys().cloned().collect();
+        let ids: Vec<String> = self.novations.keys().cloned().collect();
         for id in ids {
-            let nov = match self.obj.data.novations.get(&id) {
-                Some(n) => n,
-                None => continue,
+            let (is_out, is_in) = {
+                let so = match self.novations.get(&id) {
+                    Some(so) => so,
+                    None => continue,
+                };
+                (so.data.side[OUT] == peer, so.data.side[IN] == peer)
             };
-            if nov.side[OUT] == peer {
+            if is_out {
                 self.remove_side(&id, OUT);
-                let in_peer = self
-                    .obj
-                    .data
-                    .novations
-                    .get(&id)
-                    .map(|n| n.side[IN].clone())
+                let in_peer = self.novations.get(&id)
+                    .map(|so| so.data.side[IN].clone())
                     .unwrap_or_default();
                 if !in_peer.is_empty() {
                     let rollback = serde_json::to_value(RollbackMsg {
                         novation_id: id.clone(),
                     })
                     .unwrap();
-                    self.send(&in_peer, &id, "rollback", rollback);
+                    self.send(&id, &in_peer, "rollback", rollback);
                 } else {
-                    self.obj.data.novations.remove(&id);
+                    self.novations.remove(&id); // Drop cleans up.
                 }
                 continue;
             }
-            if nov.side[IN] == peer {
+            if is_in {
                 self.remove_side(&id, IN);
-                let out_peer = self
-                    .obj
-                    .data
-                    .novations
-                    .get(&id)
-                    .map(|n| n.side[OUT].clone())
+                let out_peer = self.novations.get(&id)
+                    .map(|so| so.data.side[OUT].clone())
                     .unwrap_or_default();
                 if out_peer.is_empty() {
-                    self.obj.data.novations.remove(&id);
+                    self.novations.remove(&id); // Drop cleans up.
                 }
             }
         }
     }
 
     fn collect_outbox(&self, peer: &str) -> Vec<OutboxCandidate> {
-        let entries = match self.obj.queues.get(peer) {
-            Some(q) if !q.is_empty() => q,
-            _ => return vec![],
-        };
-        // Return only the head entry (bilateral sync sends one at a time).
-        let entry = &entries[0];
-        vec![OutboxCandidate {
-            method: entry.method.clone(),
-            payload: entry.payload.clone(),
-            queued_at: entry.time,
-            queue_id: peer.to_string(),
-        }]
+        // Find the first novation that has a pending entry for this peer.
+        // queue_id = novation_id, so dequeue knows which SyncObject to use.
+        for (id, so) in &self.novations {
+            if let Some(entry) = so.peek(peer) {
+                return vec![OutboxCandidate {
+                    method: entry.method.clone(),
+                    payload: entry.payload.clone(),
+                    queued_at: entry.time,
+                    queue_id: id.clone(),
+                }];
+            }
+        }
+        vec![]
     }
 
-    fn dequeue(&mut self, peer: &str, _queue_id: &str) {
-        self.obj.dequeue(peer);
+    fn dequeue(&mut self, peer: &str, queue_id: &str) {
+        // queue_id is the novation_id.
+        if let Some(so) = self.novations.get_mut(queue_id) {
+            so.dequeue(peer);
+        }
     }
 
     fn outbox_has(&self, peer: &str) -> bool {
-        self.obj.has_pending(peer)
+        self.novations.values().any(|so| so.has_pending(peer))
     }
 }
 
@@ -652,25 +638,24 @@ fn random_novation_id() -> String {
 mod tests {
     use super::*;
 
+    /// Helper: insert a raw novation (no kick) for testing.
+    fn insert_test_nov(t: &mut Triad, id: &str, nov: Novation) {
+        t.novations.insert(id.to_string(), SyncObject::without_kick(nov));
+    }
+
     #[test]
     fn triad_reserved_counts() {
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.obj.data.novations.insert(
-            "n1".into(),
-            Novation {
-                amount: 100,
-                side: ["bob@b.com".into(), "carol@c.com".into()],
-                initiator: false,
-            },
-        );
-        t.obj.data.novations.insert(
-            "n2".into(),
-            Novation {
-                amount: 50,
-                side: ["bob@b.com".into(), "".into()],
-                initiator: false,
-            },
-        );
+        insert_test_nov(&mut t, "n1", Novation {
+            amount: 100,
+            side: ["bob@b.com".into(), "carol@c.com".into()],
+            initiator: false,
+        });
+        insert_test_nov(&mut t, "n2", Novation {
+            amount: 50,
+            side: ["bob@b.com".into(), "".into()],
+            initiator: false,
+        });
         assert_eq!(t.reserved("bob@b.com", IN), 150);
         assert_eq!(t.reserved("carol@c.com", OUT), 100);
         assert_eq!(t.reserved("carol@c.com", IN), 0);
@@ -681,14 +666,11 @@ mod tests {
         let mut t = Triad::for_test("triad", "alice@a.com");
         assert!(!t.busy("bob@b.com"));
 
-        t.obj.data.novations.insert(
-            "n1".into(),
-            Novation {
-                amount: 100,
-                side: ["bob@b.com".into(), "carol@c.com".into()],
-                initiator: false,
-            },
-        );
+        insert_test_nov(&mut t, "n1", Novation {
+            amount: 100,
+            side: ["bob@b.com".into(), "carol@c.com".into()],
+            initiator: false,
+        });
         assert!(t.busy("bob@b.com"));
         assert!(t.busy("carol@c.com"));
         assert!(!t.busy("dave@d.com"));
@@ -712,27 +694,24 @@ mod tests {
             .handle_request("bob@b.com", "commit", Some(payload), 0)
             .unwrap();
         assert!(result.ok);
-        assert!(t.obj.data.novations.contains_key("test-nov"));
+        assert!(t.novations.contains_key("test-nov"));
 
-        let nov = &t.obj.data.novations["test-nov"];
-        assert_eq!(nov.amount, 100);
-        assert_eq!(nov.side[IN], "bob@b.com");
-        assert_eq!(nov.side[OUT], "");
-        // Should have forwarded commit to carol.
-        assert!(t.obj.has_pending("carol@c.com"));
+        let so = &t.novations["test-nov"];
+        assert_eq!(so.data.amount, 100);
+        assert_eq!(so.data.side[IN], "bob@b.com");
+        assert_eq!(so.data.side[OUT], "");
+        // Should have forwarded commit to carol via this novation's queue.
+        assert!(so.has_pending("carol@c.com"));
     }
 
     #[test]
     fn triad_rollback_clears_novation() {
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.obj.data.novations.insert(
-            "n1".into(),
-            Novation {
-                amount: 100,
-                side: ["".into(), "bob@b.com".into()],
-                initiator: false,
-            },
-        );
+        insert_test_nov(&mut t, "n1", Novation {
+            amount: 100,
+            side: ["".into(), "bob@b.com".into()],
+            initiator: false,
+        });
 
         let payload = serde_json::to_value(RollbackMsg {
             novation_id: "n1".into(),
@@ -742,37 +721,87 @@ mod tests {
             .handle_request("bob@b.com", "rollback", Some(payload), 0)
             .unwrap();
         assert!(result.ok);
-        assert!(!t.obj.data.novations.contains_key("n1"));
+        assert!(!t.novations.contains_key("n1"));
     }
 
     #[test]
     fn triad_force_remove_rolls_back_out_side() {
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.obj.data.novations.insert(
-            "n1".into(),
-            Novation {
-                amount: 100,
-                side: ["charlie@c.com".into(), "bob@b.com".into()],
-                initiator: false,
-            },
-        );
+        insert_test_nov(&mut t, "n1", Novation {
+            amount: 100,
+            side: ["charlie@c.com".into(), "bob@b.com".into()],
+            initiator: false,
+        });
 
         t.force_remove("bob@b.com");
 
-        // OUT side cleared; rollback sent to IN peer.
-        let nov = &t.obj.data.novations["n1"];
-        assert_eq!(nov.side[OUT], "");
-        assert!(t.obj.has_pending("charlie@c.com"));
+        // OUT side cleared; rollback sent to IN peer via n1's queue.
+        let so = &t.novations["n1"];
+        assert_eq!(so.data.side[OUT], "");
+        assert!(so.has_pending("charlie@c.com"));
     }
 
     #[test]
     fn triad_collect_outbox_returns_head() {
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.obj.send("bob@b.com", "commit", None);
-        t.obj.send("bob@b.com", "finalize", None);
+        insert_test_nov(&mut t, "nov-a", Novation {
+            amount: 100,
+            side: ["bob@b.com".into(), "".into()],
+            initiator: false,
+        });
+        // Queue two messages on nov-a's SyncObject for bob.
+        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "commit", None);
+        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "finalize", None);
 
         let candidates = t.collect_outbox("bob@b.com");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].method, "commit");
+        assert_eq!(candidates[0].queue_id, "nov-a"); // queue_id = novation_id
+    }
+
+    #[test]
+    fn triad_dequeue_uses_novation_id() {
+        let mut t = Triad::for_test("triad", "alice@a.com");
+        insert_test_nov(&mut t, "nov-a", Novation {
+            amount: 100,
+            side: ["bob@b.com".into(), "".into()],
+            initiator: false,
+        });
+        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "commit", None);
+        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "finalize", None);
+
+        // Dequeue using novation_id as queue_id.
+        t.dequeue("bob@b.com", "nov-a");
+        let entry = t.novations["nov-a"].peek("bob@b.com").unwrap();
+        assert_eq!(entry.method, "finalize");
+    }
+
+    #[test]
+    fn triad_drop_cleans_up_queues() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let kick_count = Arc::new(AtomicUsize::new(0));
+        let kc = kick_count.clone();
+        let kick: KickFn = Arc::new(move |_| {
+            kc.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let mut t = Triad::for_test("triad", "alice@a.com");
+        t.kick = Some(kick);
+        t.insert_novation("n1".into(), Novation {
+            amount: 100,
+            side: ["bob@b.com".into(), "".into()],
+            initiator: false,
+        });
+        // Queue a message so there's something to clean up.
+        t.novations.get_mut("n1").unwrap().send("bob@b.com", "commit", None);
+
+        // Reset counter (send already kicked once).
+        kick_count.store(0, Ordering::SeqCst);
+
+        // Remove novation — Drop should kick bob.
+        t.novations.remove("n1");
+        assert_eq!(kick_count.load(Ordering::SeqCst), 1);
     }
 }
