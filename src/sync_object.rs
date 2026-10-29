@@ -11,7 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::Ordering;
 
+use crate::link::RefCountHandle;
 use crate::registry::RegistryRef;
 
 /// SyncObject<T> wraps module data with a registry-managed queue.
@@ -31,17 +33,28 @@ pub struct SyncObject<T> {
     queue_id: u64,
     /// Shared reference to the registry.
     registry: Option<RegistryRef>,
+    /// Shared ref count on the ConnectionState — decremented on Drop.
+    ref_count: Option<RefCountHandle>,
 }
 
 impl<T> SyncObject<T> {
     /// Create a new SyncObject bound to a peer, registering a queue in the registry.
-    pub fn new(data: T, peer: &str, registry: &RegistryRef, module: &str) -> Self {
+    /// The `ref_count` handle comes from the ConnectionState for this module+peer.
+    pub fn new(
+        data: T,
+        peer: &str,
+        registry: &RegistryRef,
+        module: &str,
+        ref_count: RefCountHandle,
+    ) -> Self {
         let queue_id = registry.lock().unwrap().register(peer, module);
+        ref_count.fetch_add(1, Ordering::Relaxed);
         SyncObject {
             data,
             peer: peer.to_string(),
             queue_id,
             registry: Some(registry.clone()),
+            ref_count: Some(ref_count),
         }
     }
 
@@ -52,6 +65,7 @@ impl<T> SyncObject<T> {
             peer: peer.to_string(),
             queue_id: 0,
             registry: None,
+            ref_count: None,
         }
     }
 
@@ -93,9 +107,12 @@ impl<T> SyncObject<T> {
 
     /// Reconnect to a registry after deserialization.
     /// The queue data should already exist in the registry from persisted state.
-    pub fn reattach(&mut self, registry: &RegistryRef, module: &str) {
+    /// The `ref_count` handle comes from the ConnectionState for this module+peer.
+    pub fn reattach(&mut self, registry: &RegistryRef, module: &str, ref_count: RefCountHandle) {
         registry.lock().unwrap().reattach(self.queue_id, &self.peer, module);
+        ref_count.fetch_add(1, Ordering::Relaxed);
         self.registry = Some(registry.clone());
+        self.ref_count = Some(ref_count);
     }
 }
 
@@ -116,6 +133,9 @@ impl<T> Drop for SyncObject<T> {
     fn drop(&mut self) {
         if let Some(ref reg) = self.registry {
             reg.lock().unwrap().unregister(self.queue_id);
+        }
+        if let Some(ref rc) = self.ref_count {
+            rc.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -148,7 +168,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
             data: inner.data,
             peer: inner.peer,
             queue_id: inner.queue_id,
-            registry: None, // restored by reattach()
+            registry: None,   // restored by reattach()
+            ref_count: None,   // restored by reattach()
         })
     }
 }
@@ -156,7 +177,14 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::RefCountHandle;
     use crate::registry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn make_ref_count() -> RefCountHandle {
+        Arc::new(AtomicUsize::new(0))
+    }
 
     #[test]
     fn deref_accesses_inner_data() {
@@ -171,7 +199,8 @@ mod tests {
     #[test]
     fn send_enqueues_in_registry() {
         let reg = registry::new_registry();
-        let obj = SyncObject::new((), "alice", &reg, "triad");
+        let rc = make_ref_count();
+        let obj = SyncObject::new((), "alice", &reg, "triad", rc);
 
         obj.send("payment", None);
 
@@ -183,8 +212,10 @@ mod tests {
     #[test]
     fn send_tracks_kicks() {
         let reg = registry::new_registry();
-        let obj_a = SyncObject::new((), "alice", &reg, "triad");
-        let obj_b = SyncObject::new((), "bob", &reg, "triad");
+        let rc_a = make_ref_count();
+        let rc_b = make_ref_count();
+        let obj_a = SyncObject::new((), "alice", &reg, "triad", rc_a);
+        let obj_b = SyncObject::new((), "bob", &reg, "triad", rc_b);
 
         obj_a.send("x", None);
         obj_b.send("y", None);
@@ -195,27 +226,40 @@ mod tests {
     }
 
     #[test]
-    fn drop_unregisters() {
+    fn drop_decrements_ref_count() {
         let reg = registry::new_registry();
+        let rc = make_ref_count();
         {
-            let _obj = SyncObject::new((), "alice", &reg, "triad");
-            assert_eq!(reg.lock().unwrap().ref_count("triad"), 1);
+            let _obj = SyncObject::new((), "alice", &reg, "triad", rc.clone());
+            assert_eq!(rc.load(Ordering::Relaxed), 1);
         }
         // After drop, ref count is back to 0.
-        assert_eq!(reg.lock().unwrap().ref_count("triad"), 0);
+        assert_eq!(rc.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn multiple_sync_objects_track_refs() {
         let reg = registry::new_registry();
-        let obj1 = SyncObject::new((), "alice", &reg, "triad");
-        let obj2 = SyncObject::new((), "bob", &reg, "triad");
-        assert_eq!(reg.lock().unwrap().ref_count("triad"), 2);
+        let rc = make_ref_count();
+        let obj1 = SyncObject::new((), "alice", &reg, "triad", rc.clone());
+        let obj2 = SyncObject::new((), "bob", &reg, "triad", rc.clone());
+        assert_eq!(rc.load(Ordering::Relaxed), 2);
 
         drop(obj1);
-        assert_eq!(reg.lock().unwrap().ref_count("triad"), 1);
+        assert_eq!(rc.load(Ordering::Relaxed), 1);
 
         drop(obj2);
-        assert_eq!(reg.lock().unwrap().ref_count("triad"), 0);
+        assert_eq!(rc.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn separate_ref_counts_per_module() {
+        let reg = registry::new_registry();
+        let rc_triad = make_ref_count();
+        let rc_loops = make_ref_count();
+        let _obj1 = SyncObject::new((), "alice", &reg, "triad", rc_triad.clone());
+        let _obj2 = SyncObject::new((), "alice", &reg, "loops", rc_loops.clone());
+        assert_eq!(rc_triad.load(Ordering::Relaxed), 1);
+        assert_eq!(rc_loops.load(Ordering::Relaxed), 1);
     }
 }

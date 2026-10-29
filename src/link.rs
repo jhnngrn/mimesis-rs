@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -21,6 +23,9 @@ pub enum ConnectionStatus {
     Connected,
 }
 
+/// Shared ref count handle. Cloned into SyncObjects so Drop can decrement.
+pub type RefCountHandle = Arc<AtomicUsize>;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectionState {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29,6 +34,11 @@ pub struct ConnectionState {
     pub intent_connect: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub intent_close: bool,
+    /// Number of live SyncObjects for this module on this peer.
+    /// Managed automatically: incremented on SyncObject creation,
+    /// decremented on Drop.
+    #[serde(skip)]
+    pub ref_count: RefCountHandle,
 }
 
 fn is_false(v: &bool) -> bool { !*v }

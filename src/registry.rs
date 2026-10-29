@@ -39,9 +39,6 @@ pub struct SyncRegistry {
     /// Peers to kick after the current handler returns.
     #[serde(skip)]
     kicks: HashSet<String>,
-    /// Ref counts per module (number of live SyncObjects).
-    #[serde(skip)]
-    ref_counts: HashMap<String, usize>,
 }
 
 impl SyncRegistry {
@@ -50,11 +47,11 @@ impl SyncRegistry {
             queues: HashMap::new(),
             next_id: 1,
             kicks: HashSet::new(),
-            ref_counts: HashMap::new(),
         }
     }
 
     /// Register a new queue for a module bound to a peer. Returns the queue ID.
+    /// Ref counting is managed by ConnectionState, not the registry.
     pub fn register(&mut self, peer: &str, module: &str) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -66,13 +63,12 @@ impl SyncRegistry {
                 entries: Vec::new(),
             },
         );
-        *self.ref_counts.entry(module.to_string()).or_insert(0) += 1;
         id
     }
 
     /// Re-register a queue with a known ID (for deserialization).
-    /// The queue data should already be in the registry from persisted state;
-    /// this just bumps the ref count.
+    /// The queue data should already be in the registry from persisted state.
+    /// Ref counting is managed by ConnectionState via the SyncObject's reattach.
     pub fn reattach(&mut self, id: u64, peer: &str, module: &str) {
         // Ensure the queue exists (it should from deserialized state).
         self.queues.entry(id).or_insert_with(|| SyncQueue {
@@ -80,20 +76,16 @@ impl SyncRegistry {
             module: module.to_string(),
             entries: Vec::new(),
         });
-        *self.ref_counts.entry(module.to_string()).or_insert(0) += 1;
         // Keep next_id above any reattached ID.
         if id >= self.next_id {
             self.next_id = id + 1;
         }
     }
 
-    /// Unregister a queue. Removes queue data and decrements ref count.
+    /// Unregister a queue. Removes queue data.
+    /// Ref count decrement happens in SyncObject::Drop via the Arc<AtomicUsize>.
     pub fn unregister(&mut self, id: u64) {
-        if let Some(entry) = self.queues.remove(&id) {
-            if let Some(count) = self.ref_counts.get_mut(&entry.module) {
-                *count = count.saturating_sub(1);
-            }
-        }
+        self.queues.remove(&id);
     }
 
     /// Enqueue a message and mark the peer for kicking.
@@ -134,11 +126,6 @@ impl SyncRegistry {
     /// Drain the kicks set — returns peers that need send_pending.
     pub fn drain_kicks(&mut self) -> HashSet<String> {
         std::mem::take(&mut self.kicks)
-    }
-
-    /// Ref count for a module (number of live SyncObjects).
-    pub fn ref_count(&self, module: &str) -> usize {
-        self.ref_counts.get(module).copied().unwrap_or(0)
     }
 
     /// True if a specific queue has pending entries.
@@ -244,20 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn ref_counts() {
-        let mut reg = SyncRegistry::new();
-        let id1 = reg.register("alice", "triad");
-        let id2 = reg.register("bob", "triad");
-        assert_eq!(reg.ref_count("triad"), 2);
-
-        reg.unregister(id1);
-        assert_eq!(reg.ref_count("triad"), 1);
-
-        reg.unregister(id2);
-        assert_eq!(reg.ref_count("triad"), 0);
-    }
-
-    #[test]
     fn multiple_queues_same_peer() {
         let mut reg = SyncRegistry::new();
         let id1 = reg.register("alice", "triad");
@@ -271,10 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn reattach_restores_ref_count() {
+    fn reattach_bumps_next_id() {
         let mut reg = SyncRegistry::new();
         reg.reattach(42, "alice", "triad");
-        assert_eq!(reg.ref_count("triad"), 1);
         assert!(reg.next_id > 42);
     }
 }

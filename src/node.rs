@@ -9,8 +9,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::link::{
-    ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest, TxResponse,
-    ValidateResult, now_secs,
+    ConnectionState, ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest,
+    TxResponse, ValidateResult, now_secs,
 };
 use crate::module::Module;
 use crate::registry::{self, RegistryRef};
@@ -87,9 +87,33 @@ impl Node {
         self.registry.clone()
     }
 
-    /// Get the ref count for a module (number of live SyncObjects).
-    pub fn module_ref_count(&self, name: &str) -> usize {
-        self.registry.lock().unwrap().ref_count(name)
+    /// Get the ConnectionState for a module on a peer's link.
+    /// Returns the root ConnectionState for the root module, or the
+    /// child's ConnectionState from the modules map.
+    pub fn connection_state(&self, peer: &str, module: &str) -> Option<&ConnectionState> {
+        let lk = self.links.get(peer)?;
+        if lk.state.root.as_deref() == Some(module) {
+            Some(&lk.state.conn)
+        } else {
+            lk.state.modules.get(module)
+        }
+    }
+
+    /// Get a mutable ConnectionState for a module on a peer's link.
+    pub fn connection_state_mut(&mut self, peer: &str, module: &str) -> Option<&mut ConnectionState> {
+        let lk = self.links.get_mut(peer)?;
+        if lk.state.root.as_deref() == Some(module) {
+            Some(&mut lk.state.conn)
+        } else {
+            lk.state.modules.get_mut(module)
+        }
+    }
+
+    /// Get the ref count handle for a module on a peer (for passing to SyncObjects).
+    /// Creates the ConnectionState entry if it doesn't exist yet.
+    pub fn ref_count_handle(&mut self, peer: &str, module: &str) -> Option<crate::link::RefCountHandle> {
+        self.connection_state(peer, module)
+            .map(|cs| cs.ref_count.clone())
     }
 
     /// True if name is a declared root module.
@@ -203,33 +227,22 @@ impl Node {
     }
 
     // -----------------------------------------------------------------------
-    // Busy checks — ref counts replace Module::Busy()
+    // Ref count checks — ConnectionState.ref_count per module per peer
     // -----------------------------------------------------------------------
 
-    /// True if any module has outbox entries for this peer or live SyncObjects.
-    fn any_busy(&self, peer: &str) -> bool {
-        let reg = self.registry.lock().unwrap();
-        for name in self.modules.keys() {
-            if reg.has_pending(name, peer) || reg.ref_count(name) > 0 {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// True if the named module (and its children if root) has outbox entries
-    /// for this peer or live SyncObjects.
-    fn module_busy(&self, name: &str, peer: &str) -> bool {
-        let reg = self.registry.lock().unwrap();
-        if reg.has_pending(name, peer) || reg.ref_count(name) > 0 {
+    /// True if any module has active refs (live SyncObjects) for this peer.
+    /// Used to NACK incoming link.close when we still hold refs.
+    fn has_active_refs(&self, peer: &str) -> bool {
+        let lk = match self.links.get(peer) {
+            Some(lk) => lk,
+            None => return false,
+        };
+        if lk.state.conn.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             return true;
         }
-        // If root, also check children.
-        if let Some(children) = self.roots.get(name) {
-            for child in children {
-                if reg.has_pending(child, peer) || reg.ref_count(child) > 0 {
-                    return true;
-                }
+        for cs in lk.state.modules.values() {
+            if cs.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                return true;
             }
         }
         false
@@ -319,7 +332,7 @@ impl Node {
                 Ok(false)
             }
             "close" => {
-                if self.any_busy(peer) {
+                if self.has_active_refs(peer) {
                     return Err(SyncError::RefsHeld);
                 }
                 let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
@@ -409,10 +422,9 @@ impl Node {
                 if name.is_empty() || !self.is_child_module(name, &root) {
                     return Ok(false);
                 }
-                // Check busy before taking mutable borrow on links.
-                {
-                    let reg = self.registry.lock().unwrap();
-                    if reg.has_pending(name, peer) || reg.ref_count(name) > 0 {
+                // Check ref count before taking mutable borrow on links.
+                if let Some(cs) = self.connection_state(peer, name) {
+                    if cs.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                         return Err(SyncError::RefsHeld);
                     }
                 }
@@ -740,11 +752,44 @@ impl Node {
         }
         // Mutable borrow dropped — now we can call &self methods freely.
 
-        // Phase 2: Read link state + busy checks (immutable).
+        // Phase 2: Read link state + ref count checks (immutable).
         let lk = self.links.get(peer)?;
 
-        // Link-level lifecycle messages have absolute priority.
-        if lk.state.conn.intent_close && !self.any_busy(peer) {
+        // Graceful link shutdown: close children individually, then link.
+        if lk.state.conn.intent_close && lk.state.conn.status == Some(ConnectionStatus::Connected) {
+            use std::sync::atomic::Ordering;
+            // Close children one at a time, each waiting for RefCount == 0.
+            for (name, mod_state) in &lk.state.modules {
+                if mod_state.status == Some(ConnectionStatus::Connected)
+                    && mod_state.ref_count.load(Ordering::Relaxed) == 0
+                {
+                    return Some(QueuedMsg {
+                        method: "module.close".into(),
+                        payload: Some(serde_json::json!({"name": name})),
+                        queued_at: 0,
+                        module: String::new(),
+                        queue_id: 0,
+                    });
+                }
+                if mod_state.status == Some(ConnectionStatus::Connected) {
+                    return None; // Child still has refs — wait.
+                }
+            }
+            // All children closed. Close link if root RefCount == 0.
+            if lk.state.conn.ref_count.load(Ordering::Relaxed) == 0 {
+                return Some(QueuedMsg {
+                    method: "link.close".into(),
+                    payload: None,
+                    queued_at: 0,
+                    module: String::new(),
+                    queue_id: 0,
+                });
+            }
+            return None; // Root still has refs — wait.
+        }
+
+        // Not-yet-connected link closing (e.g. cancel during handshake).
+        if lk.state.conn.intent_close {
             return Some(QueuedMsg {
                 method: "link.close".into(),
                 payload: None,
@@ -753,6 +798,7 @@ impl Node {
                 queue_id: 0,
             });
         }
+
         if lk.state.conn.intent_connect {
             let root = lk.state.root.clone().unwrap_or_default();
             return Some(QueuedMsg {
@@ -768,21 +814,28 @@ impl Node {
             return None;
         }
 
-        // Collect module close intents (needs busy check).
-        let close_name: Option<String> = lk
-            .state
-            .modules
-            .iter()
-            .find(|(name, s)| s.intent_close && !self.module_busy(name, peer))
-            .map(|(name, _)| name.clone());
-        if let Some(name) = close_name {
-            return Some(QueuedMsg {
-                method: "module.close".into(),
-                payload: Some(serde_json::json!({"name": name})),
-                queued_at: 0,
-                module: String::new(),
-                queue_id: 0,
-            });
+        // Module close intents (from SetModules, not link-level shutdown).
+        {
+            use std::sync::atomic::Ordering;
+            let close_name: Option<String> = lk
+                .state
+                .modules
+                .iter()
+                .find(|(_, s)| {
+                    s.intent_close
+                        && s.status == Some(ConnectionStatus::Connected)
+                        && s.ref_count.load(Ordering::Relaxed) == 0
+                })
+                .map(|(name, _)| name.clone());
+            if let Some(name) = close_name {
+                return Some(QueuedMsg {
+                    method: "module.close".into(),
+                    payload: Some(serde_json::json!({"name": name})),
+                    queued_at: 0,
+                    module: String::new(),
+                    queue_id: 0,
+                });
+            }
         }
 
         // Collect module connect intents.
