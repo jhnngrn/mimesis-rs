@@ -7,12 +7,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::link::{
     ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest, TxResponse,
     ValidateResult, now_secs,
 };
 use crate::module::Module;
+use crate::sync_object::RefFn;
 
 /// Maximum number of concurrent links per node.
 pub const MAX_LINKS: usize = 64;
@@ -54,6 +57,9 @@ pub struct Node {
     /// Registered modules by name.
     #[serde(skip)]
     modules: HashMap<String, Box<dyn Module>>,
+    /// Ref counts per module — tracked via SyncObject lifecycle.
+    #[serde(skip)]
+    ref_counts: HashMap<String, Arc<AtomicUsize>>,
 }
 
 impl Node {
@@ -64,6 +70,7 @@ impl Node {
             invite_mode: InviteMode::default(),
             roots: HashMap::new(),
             modules: HashMap::new(),
+            ref_counts: HashMap::new(),
         }
     }
 
@@ -75,6 +82,28 @@ impl Node {
     /// Register a module instance.
     pub fn register_module(&mut self, name: &str, module: Box<dyn Module>) {
         self.modules.insert(name.to_string(), module);
+    }
+
+    /// Create a RefFn for a module. The returned callback increments on
+    /// `true` (SyncObject created) and decrements on `false` (SyncObject dropped).
+    /// The framework checks these counts instead of Module::Busy().
+    pub fn create_ref_fn(&mut self, module_name: &str) -> RefFn {
+        let counter = Arc::new(AtomicUsize::new(0));
+        self.ref_counts.insert(module_name.to_string(), counter.clone());
+        Arc::new(move |acquired| {
+            if acquired {
+                counter.fetch_add(1, Ordering::SeqCst);
+            } else {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+    }
+
+    /// Get the ref count for a module (number of live SyncObjects).
+    pub fn module_ref_count(&self, name: &str) -> usize {
+        self.ref_counts
+            .get(name)
+            .map_or(0, |c| c.load(Ordering::SeqCst))
     }
 
     /// True if name is a declared root module.
@@ -188,23 +217,24 @@ impl Node {
     }
 
     // -----------------------------------------------------------------------
-    // Busy checks
+    // Busy checks — ref counts replace Module::Busy()
     // -----------------------------------------------------------------------
 
-    /// True if any module is busy with or has outbox entries for this peer.
+    /// True if any module has outbox entries for this peer or live SyncObjects.
     fn any_busy(&self, peer: &str) -> bool {
-        for (_, m) in &self.modules {
-            if m.outbox_has(peer) || m.busy(peer) {
+        for (name, m) in &self.modules {
+            if m.outbox_has(peer) || self.module_ref_count(name) > 0 {
                 return true;
             }
         }
         false
     }
 
-    /// True if the named module (and its children if root) is busy.
+    /// True if the named module (and its children if root) has outbox entries
+    /// for this peer or live SyncObjects.
     fn module_busy(&self, name: &str, peer: &str) -> bool {
         if let Some(m) = self.modules.get(name) {
-            if m.outbox_has(peer) || m.busy(peer) {
+            if m.outbox_has(peer) || self.module_ref_count(name) > 0 {
                 return true;
             }
         }
@@ -212,7 +242,7 @@ impl Node {
         if let Some(children) = self.roots.get(name) {
             for child in children {
                 if let Some(m) = self.modules.get(child.as_str()) {
-                    if m.outbox_has(peer) || m.busy(peer) {
+                    if m.outbox_has(peer) || self.module_ref_count(child) > 0 {
                         return true;
                     }
                 }
@@ -395,19 +425,18 @@ impl Node {
                 if name.is_empty() || !self.is_child_module(name, &root) {
                     return Ok(false);
                 }
-                let lk = self.links.get_mut(peer).unwrap();
-                let mod_state = match lk.state.modules.get(name) {
-                    Some(s) => s,
-                    None => return Ok(true), // already gone
-                };
-                // Check busy.
+                // Check busy before taking mutable borrow on links.
                 if let Some(m) = self.modules.get(name) {
-                    if m.outbox_has(peer) || m.busy(peer) {
+                    if m.outbox_has(peer) || self.module_ref_count(name) > 0 {
                         return Err(SyncError::RefsHeld);
                     }
                 }
-                let was_connected =
-                    mod_state.status == Some(ConnectionStatus::Connected);
+                let lk = self.links.get_mut(peer).unwrap();
+                let was_connected = lk.state.modules.get(name)
+                    .map_or(false, |s| s.status == Some(ConnectionStatus::Connected));
+                if !lk.state.modules.contains_key(name) {
+                    return Ok(true); // already gone
+                }
                 lk.state.modules.remove(name);
                 if was_connected {
                     if let Some(m) = self.modules.get_mut(name) {
@@ -911,9 +940,6 @@ mod tests {
         }
         fn status(&self) -> Option<Value> {
             None
-        }
-        fn busy(&self, _peer: &str) -> bool {
-            false
         }
         fn force_remove(&mut self, peer: &str) {
             self.on_close(peer);

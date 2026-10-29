@@ -53,10 +53,6 @@ pub trait Module: Send + Sync {
     /// Return module status for the account API.
     fn status(&self) -> Option<Value>;
 
-    /// Report whether this module has active work with a peer.
-    /// The framework checks this before sending module.close or link.close.
-    fn busy(&self, peer: &str) -> bool;
-
     /// Unilateral cleanup — called when a link is force-removed.
     fn force_remove(&mut self, peer: &str);
 

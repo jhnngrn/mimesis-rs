@@ -21,11 +21,17 @@ use crate::link::OutboxEntry;
 /// Each call means "kick this peer — something changed."
 pub type KickFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Ref callback: called with `true` when a SyncObject is created (ref acquired),
+/// `false` when dropped (ref released). The framework uses this to track how many
+/// live SyncObjects a module has — replacing Module::Busy().
+pub type RefFn = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// SyncObject<T> wraps module data with per-peer message queues.
 ///
 /// - `data: T` — the module's own state (e.g. Novation, Pathfinding)
 /// - `queues: HashMap<String, Vec<OutboxEntry>>` — peer → pending messages
 /// - `kick: KickFn` — framework callback to kick peers on drop
+/// - `ref_fn: RefFn` — framework callback for ref counting (constructor = ref, Drop = unref)
 ///
 /// Implements `Deref<Target=T>` so module code accesses T's fields
 /// transparently: `sync_obj.some_field` reads `sync_obj.data.some_field`.
@@ -36,25 +42,30 @@ pub struct SyncObject<T> {
     pub queues: HashMap<String, Vec<OutboxEntry>>,
     /// Framework callback. Called for each peer on drop.
     kick: Option<KickFn>,
+    /// Ref callback. Called with true on creation, false on drop.
+    ref_fn: Option<RefFn>,
 }
 
 impl<T> SyncObject<T> {
     /// Create a new SyncObject wrapping the given data.
-    /// `kick` is the framework callback for notifying peers.
-    pub fn new(data: T, kick: KickFn) -> Self {
+    /// `kick` notifies peers on drop; `ref_fn` tracks the ref lifecycle.
+    pub fn new(data: T, kick: KickFn, ref_fn: RefFn) -> Self {
+        ref_fn(true); // ref acquired
         SyncObject {
             data,
             queues: HashMap::new(),
             kick: Some(kick),
+            ref_fn: Some(ref_fn),
         }
     }
 
-    /// Create a SyncObject without a kick callback (for testing).
+    /// Create a SyncObject without callbacks (for testing).
     pub fn without_kick(data: T) -> Self {
         SyncObject {
             data,
             queues: HashMap::new(),
             kick: None,
+            ref_fn: None,
         }
     }
 
@@ -110,11 +121,6 @@ impl<T> SyncObject<T> {
             .collect()
     }
 
-    /// True if the module is "busy" with this peer (has queued messages).
-    /// Modules can override this with additional logic.
-    pub fn busy(&self, peer: &str) -> bool {
-        self.has_pending(peer)
-    }
 }
 
 impl<T> Deref for SyncObject<T> {
@@ -132,6 +138,10 @@ impl<T> DerefMut for SyncObject<T> {
 
 impl<T> Drop for SyncObject<T> {
     fn drop(&mut self) {
+        // Release ref first — framework sees ref count decrease.
+        if let Some(ref ref_fn) = self.ref_fn {
+            ref_fn(false);
+        }
         // Queues die with the object — no stale outbox possible.
         // Kick every peer so the sync loop picks up the removal.
         if let Some(ref kick) = self.kick {
@@ -167,7 +177,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
         Ok(SyncObject {
             data: inner.data,
             queues: inner.queues,
-            kick: None, // framework restores this
+            kick: None,    // framework restores this
+            ref_fn: None,  // framework restores this
         })
     }
 }
@@ -187,6 +198,10 @@ mod tests {
         assert_eq!(obj.balance, 42);
     }
 
+    fn noop_ref_fn() -> RefFn {
+        Arc::new(|_| {})
+    }
+
     #[test]
     fn send_enqueues_and_kicks() {
         let kicked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -195,7 +210,7 @@ mod tests {
             kicked2.lock().unwrap().push(peer.to_string());
         });
 
-        let mut obj = SyncObject::new((), kick);
+        let mut obj = SyncObject::new((), kick, noop_ref_fn());
         obj.send("alice@example.com", "payment", None);
         obj.send("alice@example.com", "payment", None);
         obj.send("bob@example.com", "payment", None);
@@ -229,7 +244,7 @@ mod tests {
             kc.fetch_add(1, Ordering::SeqCst);
         });
 
-        let mut obj = SyncObject::new((), kick);
+        let mut obj = SyncObject::new((), kick, noop_ref_fn());
         obj.send("alice@example.com", "x", None);
         obj.send("bob@example.com", "y", None);
 
@@ -240,5 +255,33 @@ mod tests {
 
         // Drop should kick once per peer with pending queues
         assert_eq!(kick_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn ref_fn_called_on_new_and_drop() {
+        let ref_count = Arc::new(AtomicUsize::new(0));
+        let rc = ref_count.clone();
+        let ref_fn: RefFn = Arc::new(move |acquired| {
+            if acquired {
+                rc.fetch_add(1, Ordering::SeqCst);
+            } else {
+                rc.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        let kick: KickFn = Arc::new(|_| {});
+
+        assert_eq!(ref_count.load(Ordering::SeqCst), 0);
+
+        let obj = SyncObject::new((), kick.clone(), ref_fn.clone());
+        assert_eq!(ref_count.load(Ordering::SeqCst), 1);
+
+        let obj2 = SyncObject::new((), kick, ref_fn);
+        assert_eq!(ref_count.load(Ordering::SeqCst), 2);
+
+        drop(obj);
+        assert_eq!(ref_count.load(Ordering::SeqCst), 1);
+
+        drop(obj2);
+        assert_eq!(ref_count.load(Ordering::SeqCst), 0);
     }
 }
