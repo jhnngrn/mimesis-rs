@@ -7,15 +7,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use crate::link::{
     ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest, TxResponse,
     ValidateResult, now_secs,
 };
 use crate::module::Module;
-use crate::sync_object::RefFn;
+use crate::registry::{self, RegistryRef};
 
 /// Maximum number of concurrent links per node.
 pub const MAX_LINKS: usize = 64;
@@ -57,9 +55,9 @@ pub struct Node {
     /// Registered modules by name.
     #[serde(skip)]
     modules: HashMap<String, Box<dyn Module>>,
-    /// Ref counts per module — tracked via SyncObject lifecycle.
+    /// Framework-owned outbox registry (queues, kicks, ref counts).
     #[serde(skip)]
-    ref_counts: HashMap<String, Arc<AtomicUsize>>,
+    registry: RegistryRef,
 }
 
 impl Node {
@@ -70,7 +68,7 @@ impl Node {
             invite_mode: InviteMode::default(),
             roots: HashMap::new(),
             modules: HashMap::new(),
-            ref_counts: HashMap::new(),
+            registry: registry::new_registry(),
         }
     }
 
@@ -84,26 +82,14 @@ impl Node {
         self.modules.insert(name.to_string(), module);
     }
 
-    /// Create a RefFn for a module. The returned callback increments on
-    /// `true` (SyncObject created) and decrements on `false` (SyncObject dropped).
-    /// The framework checks these counts instead of Module::Busy().
-    pub fn create_ref_fn(&mut self, module_name: &str) -> RefFn {
-        let counter = Arc::new(AtomicUsize::new(0));
-        self.ref_counts.insert(module_name.to_string(), counter.clone());
-        Arc::new(move |acquired| {
-            if acquired {
-                counter.fetch_add(1, Ordering::SeqCst);
-            } else {
-                counter.fetch_sub(1, Ordering::SeqCst);
-            }
-        })
+    /// Get a clone of the registry reference (for passing to modules/SyncObjects).
+    pub fn registry(&self) -> RegistryRef {
+        self.registry.clone()
     }
 
     /// Get the ref count for a module (number of live SyncObjects).
     pub fn module_ref_count(&self, name: &str) -> usize {
-        self.ref_counts
-            .get(name)
-            .map_or(0, |c| c.load(Ordering::SeqCst))
+        self.registry.lock().unwrap().ref_count(name)
     }
 
     /// True if name is a declared root module.
@@ -222,8 +208,9 @@ impl Node {
 
     /// True if any module has outbox entries for this peer or live SyncObjects.
     fn any_busy(&self, peer: &str) -> bool {
-        for (name, m) in &self.modules {
-            if m.outbox_has(peer) || self.module_ref_count(name) > 0 {
+        let reg = self.registry.lock().unwrap();
+        for name in self.modules.keys() {
+            if reg.has_pending(name, peer) || reg.ref_count(name) > 0 {
                 return true;
             }
         }
@@ -233,18 +220,15 @@ impl Node {
     /// True if the named module (and its children if root) has outbox entries
     /// for this peer or live SyncObjects.
     fn module_busy(&self, name: &str, peer: &str) -> bool {
-        if let Some(m) = self.modules.get(name) {
-            if m.outbox_has(peer) || self.module_ref_count(name) > 0 {
-                return true;
-            }
+        let reg = self.registry.lock().unwrap();
+        if reg.has_pending(name, peer) || reg.ref_count(name) > 0 {
+            return true;
         }
         // If root, also check children.
         if let Some(children) = self.roots.get(name) {
             for child in children {
-                if let Some(m) = self.modules.get(child.as_str()) {
-                    if m.outbox_has(peer) || self.module_ref_count(child) > 0 {
-                        return true;
-                    }
+                if reg.has_pending(child, peer) || reg.ref_count(child) > 0 {
+                    return true;
                 }
             }
         }
@@ -426,8 +410,9 @@ impl Node {
                     return Ok(false);
                 }
                 // Check busy before taking mutable borrow on links.
-                if let Some(m) = self.modules.get(name) {
-                    if m.outbox_has(peer) || self.module_ref_count(name) > 0 {
+                {
+                    let reg = self.registry.lock().unwrap();
+                    if reg.has_pending(name, peer) || reg.ref_count(name) > 0 {
                         return Err(SyncError::RefsHeld);
                     }
                 }
@@ -658,15 +643,13 @@ impl Node {
                 // Extract pending info before mutable borrow.
                 let pending_method;
                 let pending_payload;
-                let pending_module;
                 let pending_queue_id;
                 {
                     let lk = self.links.get(&peer).unwrap();
                     let p = lk.pending.as_ref().unwrap();
                     pending_method = p.method.clone();
                     pending_payload = p.payload.clone();
-                    pending_module = p.module.clone();
-                    pending_queue_id = p.queue_id.clone();
+                    pending_queue_id = p.queue_id;
                 }
 
                 self.dispatch_response(
@@ -677,11 +660,9 @@ impl Node {
                     resp.timestamp,
                 );
 
-                // Dequeue from originating module.
-                if !pending_module.is_empty() {
-                    if let Some(m) = self.modules.get_mut(pending_module.as_str()) {
-                        m.dequeue(&peer, &pending_queue_id);
-                    }
+                // Dequeue from registry.
+                if pending_queue_id != 0 {
+                    self.registry.lock().unwrap().dequeue(pending_queue_id, &peer);
                 }
 
                 let lk = self.links.get_mut(&peer).unwrap();
@@ -769,7 +750,7 @@ impl Node {
                 payload: None,
                 queued_at: 0,
                 module: String::new(),
-                queue_id: String::new(),
+                queue_id: 0,
             });
         }
         if lk.state.conn.intent_connect {
@@ -779,7 +760,7 @@ impl Node {
                 payload: Some(serde_json::json!({"name": root})),
                 queued_at: 0,
                 module: String::new(),
-                queue_id: String::new(),
+                queue_id: 0,
             });
         }
 
@@ -800,7 +781,7 @@ impl Node {
                 payload: Some(serde_json::json!({"name": name})),
                 queued_at: 0,
                 module: String::new(),
-                queue_id: String::new(),
+                queue_id: 0,
             });
         }
 
@@ -817,12 +798,11 @@ impl Node {
                 payload: Some(serde_json::json!({"name": name})),
                 queued_at: 0,
                 module: String::new(),
-                queue_id: String::new(),
+                queue_id: 0,
             });
         }
 
-        // Phase 3: Collect from module outboxes — oldest entry wins.
-        // Snapshot connected module names first, then iterate modules.
+        // Phase 3: Collect from registry outboxes — oldest entry wins.
         let connected_modules: Vec<String> = self
             .modules
             .keys()
@@ -830,10 +810,10 @@ impl Node {
             .cloned()
             .collect();
 
+        let reg = self.registry.lock().unwrap();
         let mut best: Option<QueuedMsg> = None;
         for mod_name in &connected_modules {
-            let m = self.modules.get(mod_name.as_str()).unwrap();
-            for candidate in m.collect_outbox(peer) {
+            for candidate in reg.collect_outbox(mod_name, peer) {
                 let msg = QueuedMsg {
                     method: format!("{}.{}", mod_name, candidate.method),
                     payload: candidate.payload,
@@ -889,7 +869,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::{HandleResult, Module, OutboxCandidate};
+    use crate::module::{HandleResult, Module};
 
     /// Minimal test module that tracks OnConnect/OnClose calls.
     struct TestModule {
@@ -944,13 +924,7 @@ mod tests {
         fn force_remove(&mut self, peer: &str) {
             self.on_close(peer);
         }
-        fn collect_outbox(&self, _peer: &str) -> Vec<OutboxCandidate> {
-            vec![]
-        }
-        fn dequeue(&mut self, _peer: &str, _queue_id: &str) {}
-        fn outbox_has(&self, _peer: &str) -> bool {
-            false
-        }
+        fn reattach_sync_objects(&mut self, _registry: &crate::registry::RegistryRef) {}
     }
 
     #[test]

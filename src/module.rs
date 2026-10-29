@@ -3,6 +3,9 @@
 //! Modules implement sync methods and account API calls. The framework
 //! dispatches by namespace: `trustline.payment` → module "trustline",
 //! method "payment".
+//!
+//! Outbox management (collect_outbox, dequeue, outbox_has) is handled
+//! entirely by the SyncRegistry — modules don't touch it.
 
 use serde_json::Value;
 
@@ -14,9 +17,10 @@ pub struct HandleResult {
 
 /// Module processes sync methods and account API calls for a namespace.
 ///
-/// In Rust-mimesis, modules use `SyncObject<T>` for their per-peer state
-/// and outbox queues. The framework collects queues from registered
-/// SyncObjects during `next_tx` — modules don't manage delivery.
+/// In Rust-mimesis, modules use `SyncObject<T>` for their per-peer state.
+/// SyncObjects register queues in the framework's SyncRegistry — the
+/// framework collects, dequeues, and kicks automatically. Modules just
+/// call `sync_object.send()` inside handlers.
 pub trait Module: Send + Sync {
     /// Called when the module becomes bilaterally connected on a link.
     fn on_connect(&mut self, peer: &str);
@@ -56,22 +60,7 @@ pub trait Module: Send + Sync {
     /// Unilateral cleanup — called when a link is force-removed.
     fn force_remove(&mut self, peer: &str);
 
-    /// Collect outbox entries for a peer. The framework calls this during
-    /// nextTx to gather pending messages from all modules.
-    /// Returns (method, payload, queued_at, queue_id) tuples.
-    fn collect_outbox(&self, peer: &str) -> Vec<OutboxCandidate>;
-
-    /// Dequeue the head entry for a peer/queue_id after response received.
-    fn dequeue(&mut self, peer: &str, queue_id: &str);
-
-    /// True if the outbox has any entry for this peer.
-    fn outbox_has(&self, peer: &str) -> bool;
-}
-
-/// A candidate message from a module's outbox, for nextTx selection.
-pub struct OutboxCandidate {
-    pub method: String,
-    pub payload: Option<Value>,
-    pub queued_at: i64,
-    pub queue_id: String,
+    /// Reconnect SyncObjects to the registry after deserialization.
+    /// The framework calls this after loading persisted state.
+    fn reattach_sync_objects(&mut self, registry: &crate::registry::RegistryRef);
 }

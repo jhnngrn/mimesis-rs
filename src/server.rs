@@ -698,7 +698,7 @@ impl Server {
 
         loop {
             // Phase 1: Lock, get next message, build envelope, unlock.
-            let (env, msg_module, msg_queue_id) = {
+            let (env, _msg_module, msg_queue_id) = {
                 let mut n = node.lock().unwrap();
                 let msg = match n.next_tx(&peer) {
                     Some(m) => m,
@@ -799,11 +799,10 @@ impl Server {
                     // Dispatch response.
                     n.dispatch_response(&peer, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
 
-                    // Dequeue from module outbox.
-                    if !msg_module.is_empty() {
-                        if let Some(m) = n.module_mut(&msg_module) {
-                            m.dequeue(&peer, &msg_queue_id);
-                        }
+                    // Dequeue from registry.
+                    if msg_queue_id != 0 {
+                        let reg = n.registry();
+                        reg.lock().unwrap().dequeue(msg_queue_id, &peer);
                     }
 
                     // Accept response (increments counter, clears pending/cached_response).

@@ -1,126 +1,93 @@
 //! SyncObject<T> — the core framework abstraction.
 //!
 //! A SyncObject wraps module data (like a Novation tracker) with
-//! per-peer message queues and automatic cleanup via Drop. When the
-//! object is dropped — removed from a map, parent struct dropped,
-//! scope exited — Drop fires: queues are cleared, and the framework
-//! is notified to kick each peer.
+//! automatic lifecycle management via the SyncRegistry. On creation
+//! it registers a queue in the registry; on Drop it unregisters.
 //!
-//! This realizes the "NextTx" pattern from the old design: each module
-//! owns its queues, and the sync loop collects from them. But Drop
-//! guarantees cleanup — no stale outbox entries, no forgotten refs.
+//! Queues live in the registry, not in SyncObject — the framework
+//! collects from the registry during nextTx, dequeues on response,
+//! and drains kicks after each handler. Modules never touch outbox
+//! plumbing directly.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 
-use crate::link::OutboxEntry;
+use crate::registry::RegistryRef;
 
-/// Callback the framework provides so SyncObject can notify it on drop.
-/// Each call means "kick this peer — something changed."
-pub type KickFn = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Ref callback: called with `true` when a SyncObject is created (ref acquired),
-/// `false` when dropped (ref released). The framework uses this to track how many
-/// live SyncObjects a module has — replacing Module::Busy().
-pub type RefFn = Arc<dyn Fn(bool) + Send + Sync>;
-
-/// SyncObject<T> wraps module data with per-peer message queues.
+/// SyncObject<T> wraps module data with a registry-managed queue.
 ///
 /// - `data: T` — the module's own state (e.g. Novation, Pathfinding)
-/// - `queues: HashMap<String, Vec<OutboxEntry>>` — peer → pending messages
-/// - `kick: KickFn` — framework callback to kick peers on drop
-/// - `ref_fn: RefFn` — framework callback for ref counting (constructor = ref, Drop = unref)
+/// - `queue_id: u64` — internal registry queue ID
+/// - `registry: RegistryRef` — shared reference to the registry
 ///
 /// Implements `Deref<Target=T>` so module code accesses T's fields
 /// transparently: `sync_obj.some_field` reads `sync_obj.data.some_field`.
 pub struct SyncObject<T> {
     /// The module's own data.
     pub data: T,
-    /// Per-peer outbox queues. The sync loop reads from these.
-    pub queues: HashMap<String, Vec<OutboxEntry>>,
-    /// Framework callback. Called for each peer on drop.
-    kick: Option<KickFn>,
-    /// Ref callback. Called with true on creation, false on drop.
-    ref_fn: Option<RefFn>,
+    /// Internal queue ID assigned by the registry.
+    queue_id: u64,
+    /// Shared reference to the registry.
+    registry: Option<RegistryRef>,
 }
 
 impl<T> SyncObject<T> {
-    /// Create a new SyncObject wrapping the given data.
-    /// `kick` notifies peers on drop; `ref_fn` tracks the ref lifecycle.
-    pub fn new(data: T, kick: KickFn, ref_fn: RefFn) -> Self {
-        ref_fn(true); // ref acquired
+    /// Create a new SyncObject, registering a queue in the registry.
+    pub fn new(data: T, registry: &RegistryRef, module: &str) -> Self {
+        let queue_id = registry.lock().unwrap().register(module);
         SyncObject {
             data,
-            queues: HashMap::new(),
-            kick: Some(kick),
-            ref_fn: Some(ref_fn),
+            queue_id,
+            registry: Some(registry.clone()),
         }
     }
 
-    /// Create a SyncObject without callbacks (for testing).
-    pub fn without_kick(data: T) -> Self {
+    /// Create a SyncObject without a registry (for testing).
+    pub fn without_registry(data: T) -> Self {
         SyncObject {
             data,
-            queues: HashMap::new(),
-            kick: None,
-            ref_fn: None,
+            queue_id: 0,
+            registry: None,
         }
     }
 
-    /// Enqueue a message for a peer.
-    pub fn send(&mut self, peer: &str, method: &str, payload: Option<serde_json::Value>) {
-        let entry = OutboxEntry {
-            method: method.to_string(),
-            payload,
-            time: crate::link::now_secs(),
-        };
-        self.queues
-            .entry(peer.to_string())
-            .or_default()
-            .push(entry);
-        if let Some(ref kick) = self.kick {
-            kick(peer);
+    /// Enqueue a message for a peer. The registry tracks the kick.
+    pub fn send(&self, peer: &str, method: &str, payload: Option<serde_json::Value>) {
+        if let Some(ref reg) = self.registry {
+            reg.lock()
+                .unwrap()
+                .enqueue(self.queue_id, peer, method, payload);
         }
     }
 
-    /// Dequeue the head entry for a peer (after response received).
-    pub fn dequeue(&mut self, peer: &str) {
-        if let Some(q) = self.queues.get_mut(peer) {
-            if !q.is_empty() {
-                q.remove(0);
-            }
-            if q.is_empty() {
-                self.queues.remove(peer);
-            }
+    /// Remove all queued entries for a peer on this queue.
+    pub fn delete_queue(&self, peer: &str) {
+        if let Some(ref reg) = self.registry {
+            reg.lock().unwrap().delete_queue(self.queue_id, peer);
         }
     }
 
-    /// Remove all queued entries for a peer.
-    pub fn delete_queue(&mut self, peer: &str) {
-        self.queues.remove(peer);
+    /// The internal queue ID (for framework use).
+    pub fn queue_id(&self) -> u64 {
+        self.queue_id
     }
 
-    /// True if there's a pending entry for this peer.
+    /// True if there's a pending entry for this peer in the registry.
     pub fn has_pending(&self, peer: &str) -> bool {
-        self.queues.get(peer).map_or(false, |q| !q.is_empty())
+        if let Some(ref reg) = self.registry {
+            let r = reg.lock().unwrap();
+            r.queue_has_pending(self.queue_id, peer)
+        } else {
+            false
+        }
     }
 
-    /// Get the oldest entry for a peer, if any.
-    pub fn peek(&self, peer: &str) -> Option<&OutboxEntry> {
-        self.queues.get(peer).and_then(|q| q.first())
+    /// Reconnect to a registry after deserialization.
+    /// The queue data should already exist in the registry from persisted state.
+    pub fn reattach(&mut self, registry: &RegistryRef, module: &str) {
+        registry.lock().unwrap().reattach(self.queue_id, module);
+        self.registry = Some(registry.clone());
     }
-
-    /// Returns all peers that have pending entries.
-    pub fn peers_with_pending(&self) -> Vec<&str> {
-        self.queues
-            .iter()
-            .filter(|(_, q)| !q.is_empty())
-            .map(|(p, _)| p.as_str())
-            .collect()
-    }
-
 }
 
 impl<T> Deref for SyncObject<T> {
@@ -138,29 +105,20 @@ impl<T> DerefMut for SyncObject<T> {
 
 impl<T> Drop for SyncObject<T> {
     fn drop(&mut self) {
-        // Release ref first — framework sees ref count decrease.
-        if let Some(ref ref_fn) = self.ref_fn {
-            ref_fn(false);
+        if let Some(ref reg) = self.registry {
+            reg.lock().unwrap().unregister(self.queue_id);
         }
-        // Queues die with the object — no stale outbox possible.
-        // Kick every peer so the sync loop picks up the removal.
-        if let Some(ref kick) = self.kick {
-            for peer in self.queues.keys() {
-                kick(peer);
-            }
-        }
-        self.queues.clear();
     }
 }
 
-// Serialize/Deserialize — only the data and queues are persisted.
-// The kick callback is restored by the framework on load.
+// Serialize/Deserialize — data and queue_id are persisted.
+// The registry reference is restored by reattach() after load.
 impl<T: Serialize> Serialize for SyncObject<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("SyncObject", 2)?;
         s.serialize_field("data", &self.data)?;
-        s.serialize_field("queues", &self.queues)?;
+        s.serialize_field("queue_id", &self.queue_id)?;
         s.end()
     }
 }
@@ -171,14 +129,13 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
         struct Inner<T> {
             data: T,
             #[serde(default)]
-            queues: HashMap<String, Vec<OutboxEntry>>,
+            queue_id: u64,
         }
         let inner = Inner::<T>::deserialize(deserializer)?;
         Ok(SyncObject {
             data: inner.data,
-            queues: inner.queues,
-            kick: None,    // framework restores this
-            ref_fn: None,  // framework restores this
+            queue_id: inner.queue_id,
+            registry: None, // restored by reattach()
         })
     }
 }
@@ -186,7 +143,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::registry;
 
     #[test]
     fn deref_accesses_inner_data() {
@@ -194,94 +151,59 @@ mod tests {
         struct MyData {
             balance: i64,
         }
-        let obj = SyncObject::without_kick(MyData { balance: 42 });
+        let obj = SyncObject::without_registry(MyData { balance: 42 });
         assert_eq!(obj.balance, 42);
     }
 
-    fn noop_ref_fn() -> RefFn {
-        Arc::new(|_| {})
+    #[test]
+    fn send_enqueues_in_registry() {
+        let reg = registry::new_registry();
+        let obj = SyncObject::new((), &reg, "triad");
+
+        obj.send("alice", "payment", None);
+        obj.send("bob", "payment", None);
+
+        let r = reg.lock().unwrap();
+        assert!(r.has_pending("triad", "alice"));
+        assert!(r.has_pending("triad", "bob"));
+        assert!(!r.has_pending("triad", "carol"));
     }
 
     #[test]
-    fn send_enqueues_and_kicks() {
-        let kicked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let kicked2 = kicked.clone();
-        let kick: KickFn = Arc::new(move |peer: &str| {
-            kicked2.lock().unwrap().push(peer.to_string());
-        });
+    fn send_tracks_kicks() {
+        let reg = registry::new_registry();
+        let obj = SyncObject::new((), &reg, "triad");
 
-        let mut obj = SyncObject::new((), kick, noop_ref_fn());
-        obj.send("alice@example.com", "payment", None);
-        obj.send("alice@example.com", "payment", None);
-        obj.send("bob@example.com", "payment", None);
+        obj.send("alice", "x", None);
+        obj.send("bob", "y", None);
 
-        assert!(obj.has_pending("alice@example.com"));
-        assert!(obj.has_pending("bob@example.com"));
-        assert!(!obj.has_pending("carol@example.com"));
-
-        let kicks = kicked.lock().unwrap();
-        assert_eq!(kicks.len(), 3);
+        let kicks = reg.lock().unwrap().drain_kicks();
+        assert!(kicks.contains("alice"));
+        assert!(kicks.contains("bob"));
     }
 
     #[test]
-    fn dequeue_removes_head() {
-        let mut obj = SyncObject::without_kick(());
-        obj.send("alice@example.com", "a", None);
-        obj.send("alice@example.com", "b", None);
-
-        assert_eq!(obj.peek("alice@example.com").unwrap().method, "a");
-        obj.dequeue("alice@example.com");
-        assert_eq!(obj.peek("alice@example.com").unwrap().method, "b");
-        obj.dequeue("alice@example.com");
-        assert!(!obj.has_pending("alice@example.com"));
+    fn drop_unregisters() {
+        let reg = registry::new_registry();
+        {
+            let _obj = SyncObject::new((), &reg, "triad");
+            assert_eq!(reg.lock().unwrap().ref_count("triad"), 1);
+        }
+        // After drop, ref count is back to 0.
+        assert_eq!(reg.lock().unwrap().ref_count("triad"), 0);
     }
 
     #[test]
-    fn drop_kicks_all_peers() {
-        let kick_count = Arc::new(AtomicUsize::new(0));
-        let kc = kick_count.clone();
-        let kick: KickFn = Arc::new(move |_peer: &str| {
-            kc.fetch_add(1, Ordering::SeqCst);
-        });
+    fn multiple_sync_objects_track_refs() {
+        let reg = registry::new_registry();
+        let obj1 = SyncObject::new((), &reg, "triad");
+        let obj2 = SyncObject::new((), &reg, "triad");
+        assert_eq!(reg.lock().unwrap().ref_count("triad"), 2);
 
-        let mut obj = SyncObject::new((), kick, noop_ref_fn());
-        obj.send("alice@example.com", "x", None);
-        obj.send("bob@example.com", "y", None);
-
-        // Reset counter (send already kicked twice)
-        kick_count.store(0, Ordering::SeqCst);
-
-        drop(obj);
-
-        // Drop should kick once per peer with pending queues
-        assert_eq!(kick_count.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn ref_fn_called_on_new_and_drop() {
-        let ref_count = Arc::new(AtomicUsize::new(0));
-        let rc = ref_count.clone();
-        let ref_fn: RefFn = Arc::new(move |acquired| {
-            if acquired {
-                rc.fetch_add(1, Ordering::SeqCst);
-            } else {
-                rc.fetch_sub(1, Ordering::SeqCst);
-            }
-        });
-        let kick: KickFn = Arc::new(|_| {});
-
-        assert_eq!(ref_count.load(Ordering::SeqCst), 0);
-
-        let obj = SyncObject::new((), kick.clone(), ref_fn.clone());
-        assert_eq!(ref_count.load(Ordering::SeqCst), 1);
-
-        let obj2 = SyncObject::new((), kick, ref_fn);
-        assert_eq!(ref_count.load(Ordering::SeqCst), 2);
-
-        drop(obj);
-        assert_eq!(ref_count.load(Ordering::SeqCst), 1);
+        drop(obj1);
+        assert_eq!(reg.lock().unwrap().ref_count("triad"), 1);
 
         drop(obj2);
-        assert_eq!(ref_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reg.lock().unwrap().ref_count("triad"), 0);
     }
 }

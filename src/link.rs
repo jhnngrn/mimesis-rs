@@ -89,9 +89,9 @@ pub struct QueuedMsg {
     /// Originating module (for dequeue after response).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub module: String,
-    /// Originating queue ID (for dequeue after response).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub queue_id: String,
+    /// Registry queue ID (for dequeue after response).
+    #[serde(default)]
+    pub queue_id: u64,
 }
 
 // ---------------------------------------------------------------------------
