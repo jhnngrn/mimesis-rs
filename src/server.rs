@@ -827,7 +827,32 @@ impl Server {
         }
     }
 
+    /// Drain kicks from the registry and send_pending only to kicked peers.
+    fn flush_kicks(self: &Arc<Self>, node: Arc<Mutex<Node>>) {
+        let kicks: Vec<String> = {
+            let n = node.lock().unwrap();
+            let reg_ref = n.registry();
+            let mut reg = reg_ref.lock().unwrap();
+            reg.drain_kicks().into_iter().collect()
+        };
+        for peer in kicks {
+            let srv = Arc::clone(self);
+            let nd = Arc::clone(&node);
+            tokio::spawn(async move {
+                srv.send_pending(nd, peer).await;
+            });
+        }
+    }
+
+    /// Drain kicks for a node by username — convenience for handlers.
+    fn flush_user(self: &Arc<Self>, username: &str) {
+        if let Some(node) = self.get_node(username) {
+            self.flush_kicks(node);
+        }
+    }
+
     /// Flush all peers for a node — spawn a send_pending task per peer.
+    /// Used at boot to resume all pending work.
     fn flush_node(self: &Arc<Self>, node: Arc<Mutex<Node>>) {
         let peers: Vec<String> = {
             let n = node.lock().unwrap();
@@ -839,13 +864,6 @@ impl Server {
             tokio::spawn(async move {
                 srv.send_pending(nd, peer).await;
             });
-        }
-    }
-
-    /// Flush a node by username — convenience for handlers.
-    fn flush_user(self: &Arc<Self>, username: &str) {
-        if let Some(node) = self.get_node(username) {
-            self.flush_node(node);
         }
     }
 
