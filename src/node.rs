@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::link::{
-    ConnectionState, ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest,
+    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest,
     TxResponse, ValidateResult, now_secs,
 };
 use crate::module::Module;
@@ -245,6 +245,36 @@ impl Node {
             }
         }
         false
+    }
+
+    // -----------------------------------------------------------------------
+    // Transport auto-connect — set SO connected on bilateral confirmation
+    // -----------------------------------------------------------------------
+
+    /// After a successful bilateral response (ok=true), if the queue belongs
+    /// to an Auto-mode SyncObject, mark it as connected in its parent tracker.
+    /// This is the "transport service" — modules don't need to call set_connected().
+    fn auto_connect_on_response(&self, queue_id: u64, ok: bool, peer: &str) {
+        if !ok || queue_id == 0 {
+            return;
+        }
+        let reg = self.registry.lock().unwrap();
+        let queue = match reg.get_queue(queue_id) {
+            Some(q) => q,
+            None => return,
+        };
+        if queue.connect_mode != ConnectMode::Auto {
+            return;
+        }
+        let module_name = queue.module.clone();
+        drop(reg); // Release lock before accessing link state.
+
+        // Find the parent tracker for this module+peer and set connected.
+        if let Some(cs) = self.connection_state(peer, &module_name) {
+            if !cs.children.is_connected(queue_id) {
+                cs.children.set_connected(queue_id);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -670,6 +700,10 @@ impl Node {
                     resp.ok,
                     resp.timestamp,
                 );
+
+                // Transport auto-connect: if this was an ok response to an
+                // Auto-mode SO, mark it connected before dequeue removes it.
+                self.auto_connect_on_response(pending_queue_id, resp.ok, &peer);
 
                 // Dequeue from registry.
                 if pending_queue_id != 0 {
