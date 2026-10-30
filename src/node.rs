@@ -18,21 +18,6 @@ use crate::registry::{self, RegistryRef};
 /// Maximum number of concurrent links per node.
 pub const MAX_LINKS: usize = 64;
 
-/// Invite mode — node-level policy for incoming connections.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InviteMode {
-    Closed,
-    Invite,
-    Open,
-}
-
-impl Default for InviteMode {
-    fn default() -> Self {
-        InviteMode::Invite
-    }
-}
-
 /// Configuration for a declared SyncObject type.
 #[derive(Debug, Clone)]
 pub struct SoConfig {
@@ -77,8 +62,6 @@ fn split_method(method: &str) -> (&str, &str) {
 pub struct Node {
     pub id: String,
     pub links: HashMap<String, Link>,
-    #[serde(default)]
-    pub invite_mode: InviteMode,
     /// Declared SO types and their configuration.
     #[serde(skip)]
     so_types: HashMap<String, SoConfig>,
@@ -95,7 +78,6 @@ impl Node {
         Node {
             id,
             links: HashMap::new(),
-            invite_mode: InviteMode::default(),
             so_types: HashMap::new(),
             modules: HashMap::new(),
             registry: registry::new_registry(),
@@ -165,6 +147,20 @@ impl Node {
     /// Get the SoConfig for a declared SO type.
     pub fn so_config(&self, name: &str) -> Option<&SoConfig> {
         self.so_types.get(name)
+    }
+
+    /// Get the ConnectMode for a declared SO type (defaults to Invite if undeclared).
+    pub fn connect_mode_for(&self, name: &str) -> ConnectMode {
+        self.so_types
+            .get(name)
+            .map_or(ConnectMode::Invite, |cfg| cfg.connect_mode)
+    }
+
+    /// Change the ConnectMode for a declared SO type at runtime.
+    pub fn set_connect_mode(&mut self, name: &str, mode: ConnectMode) {
+        if let Some(cfg) = self.so_types.get_mut(name) {
+            cfg.connect_mode = mode;
+        }
     }
 
     /// Get an existing link.
@@ -385,10 +381,10 @@ impl Node {
                 if lk.state.root.as_deref() != Some(name) {
                     return Ok(false);
                 }
-                // Accept: mutual add or open mode.
+                // Accept: mutual add or Auto mode.
                 let status = lk.state.conn.status.clone();
-                let is_open = self.invite_mode == InviteMode::Open;
-                if status == Some(ConnectionStatus::Waiting) || is_open {
+                let is_auto = self.connect_mode_for(name) == ConnectMode::Auto;
+                if status == Some(ConnectionStatus::Waiting) || is_auto {
                     let lk = self.links.get_mut(peer).unwrap();
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
@@ -460,6 +456,9 @@ impl Node {
                 if !self.modules.contains_key(name) {
                     return Ok(false);
                 }
+                // Read connect mode before taking mutable borrow.
+                let mode = self.connect_mode_for(name);
+
                 let lk = self.links.get_mut(peer).unwrap();
                 let mod_state = lk.state.modules.entry(name.to_string()).or_default();
 
@@ -478,13 +477,17 @@ impl Node {
                     }
                     return Ok(true);
                 }
-                // Open mode — auto-accept.
-                if self.invite_mode == InviteMode::Open {
+                // Auto mode — auto-accept.
+                if mode == ConnectMode::Auto {
                     mod_state.status = Some(ConnectionStatus::Connected);
                     if let Some(m) = self.modules.get_mut(name) {
                         m.on_connect(peer);
                     }
                     return Ok(true);
+                }
+                // Closed — reject.
+                if mode == ConnectMode::Closed {
+                    return Ok(false);
                 }
                 // Invite — mark incoming, NACK.
                 mod_state.status = Some(ConnectionStatus::Incoming);
@@ -688,16 +691,7 @@ impl Node {
             if env.method != "link.connect" {
                 return Err(SyncError::NoLink);
             }
-            if self.invite_mode == InviteMode::Closed {
-                return Ok(TxResponse {
-                    ok: false,
-                    timestamp: now_secs(),
-                });
-            }
-            if self.links.len() >= MAX_LINKS {
-                return Err(SyncError::MaxLinks);
-            }
-            // Validate root module name before creating state.
+            // Validate root SO type name.
             let root_name = env
                 .payload
                 .as_ref()
@@ -709,6 +703,16 @@ impl Node {
                     "unknown root module {:?}",
                     root_name
                 )));
+            }
+            // Check root SO type's connect mode.
+            if self.connect_mode_for(root_name) == ConnectMode::Closed {
+                return Ok(TxResponse {
+                    ok: false,
+                    timestamp: now_secs(),
+                });
+            }
+            if self.links.len() >= MAX_LINKS {
+                return Err(SyncError::MaxLinks);
             }
             let mut lk = Link::new(&self.id, &peer);
             lk.state.root = Some(root_name.to_string());
@@ -1124,11 +1128,10 @@ mod tests {
         assert_eq!(msg.method, "link.connect");
         let env = alice.build_request("bob@b.com", &msg).unwrap();
 
-        // Bob receives it (open mode for auto-accept).
+        // Bob receives it (Auto mode for auto-accept).
         let mut bob = Node::new("bob@b.com".into());
-        bob.declare_root("trustline", vec![]);
+        bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
-        bob.invite_mode = InviteMode::Open;
 
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp.ok);

@@ -26,14 +26,16 @@ pub enum ConnectionStatus {
 // ConnectMode — how a SyncObject connects
 // ---------------------------------------------------------------------------
 
-/// How a SyncObject establishes its bilateral connection.
+/// How a SyncObject type handles incoming connections.
 /// - Auto: connected automatically when the first bilateral transaction succeeds.
 /// - Invite: requires an explicit accept/reject handshake before connecting.
+/// - Closed: does not accept incoming connections at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnectMode {
     Auto,
     Invite,
+    Closed,
 }
 
 impl Default for ConnectMode {
