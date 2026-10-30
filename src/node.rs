@@ -1,18 +1,18 @@
 //! Node — collection of bilateral links for an identity.
 //!
-//! Manages the set of links, module dispatch, and the sync protocol
-//! that drives bilateral communication. Outbox messages are collected
-//! from registered modules' SyncObject queues during nextTx.
+//! Manages the set of links, SO instance dispatch, and the sync protocol
+//! that drives bilateral communication. Messages are routed to SO instances
+//! by their bilateral ID (so_id), not by namespace strings.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::link::{
-    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SyncError, TxRequest,
-    TxResponse, ValidateResult, now_secs,
+    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
+    SyncError, TxRequest, TxResponse, ValidateResult, now_secs,
 };
-use crate::module::Module;
+use crate::module::{HandleResult, Module, SoHandler};
 use crate::registry::{self, RegistryRef};
 
 /// Maximum number of concurrent links per node.
@@ -57,6 +57,9 @@ fn split_method(method: &str) -> (&str, &str) {
     }
 }
 
+/// Key for looking up an SO handler: (peer, so_id).
+type HandlerKey = (String, u64);
+
 /// Node manages the set of bilateral links for an identity.
 #[derive(Serialize, Deserialize)]
 pub struct Node {
@@ -65,9 +68,18 @@ pub struct Node {
     /// Declared SO types and their configuration.
     #[serde(skip)]
     so_types: HashMap<String, SoConfig>,
-    /// Registered modules by name.
+    /// Registered modules by name (legacy — used during migration).
     #[serde(skip)]
     modules: HashMap<String, Box<dyn Module>>,
+    /// SO handlers keyed by (peer, so_id).
+    #[serde(skip)]
+    handlers: HashMap<HandlerKey, Box<dyn SoHandler>>,
+    /// Factory functions for creating SO handlers, keyed by SO type name.
+    #[serde(skip)]
+    so_factories: HashMap<String, Box<dyn Fn() -> Box<dyn SoHandler> + Send + Sync>>,
+    /// Next SO instance ID to assign.
+    #[serde(default)]
+    next_so_id: u64,
     /// Framework-owned outbox registry (queues, kicks, ref counts).
     #[serde(skip)]
     registry: RegistryRef,
@@ -80,6 +92,9 @@ impl Node {
             links: HashMap::new(),
             so_types: HashMap::new(),
             modules: HashMap::new(),
+            handlers: HashMap::new(),
+            so_factories: HashMap::new(),
+            next_so_id: 1, // 0 reserved for lifecycle
             registry: registry::new_registry(),
         }
     }
@@ -89,12 +104,22 @@ impl Node {
         self.so_types.insert(name.to_string(), config);
     }
 
-    /// Backwards-compatible: declare a root with children (all Auto mode).
-    pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
-        self.so_types.insert(name.to_string(), SoConfig::auto().with_children(children));
+    /// Declare a SO type with a handler factory.
+    pub fn declare_so_with_factory<F>(&mut self, name: &str, config: SoConfig, factory: F)
+    where
+        F: Fn() -> Box<dyn SoHandler> + Send + Sync + 'static,
+    {
+        self.so_types.insert(name.to_string(), config);
+        self.so_factories.insert(name.to_string(), Box::new(factory));
     }
 
-    /// Register a module instance.
+    /// Backwards-compatible: declare a root with children (all Auto mode).
+    pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
+        self.so_types
+            .insert(name.to_string(), SoConfig::auto().with_children(children));
+    }
+
+    /// Register a module instance (legacy — use declare_so_with_factory instead).
     pub fn register_module(&mut self, name: &str, module: Box<dyn Module>) {
         self.modules.insert(name.to_string(), module);
     }
@@ -104,9 +129,33 @@ impl Node {
         self.registry.clone()
     }
 
+    /// Allocate a new bilateral SO instance ID.
+    fn alloc_so_id(&mut self) -> u64 {
+        let id = self.next_so_id;
+        self.next_so_id += 1;
+        id
+    }
+
+    /// Get an SO handler by (peer, so_id).
+    pub fn handler(&self, peer: &str, so_id: u64) -> Option<&Box<dyn SoHandler>> {
+        self.handlers.get(&(peer.to_string(), so_id))
+    }
+
+    /// Get a mutable SO handler by (peer, so_id).
+    pub fn handler_mut(&mut self, peer: &str, so_id: u64) -> Option<&mut Box<dyn SoHandler>> {
+        self.handlers.get_mut(&(peer.to_string(), so_id))
+    }
+
+    /// Create a new SO handler instance from a registered factory.
+    fn create_handler(&self, so_type: &str) -> Option<Box<dyn SoHandler>> {
+        self.so_factories.get(so_type).map(|f| f())
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy methods — kept during migration
+    // -----------------------------------------------------------------------
+
     /// Get the ConnectionState for a module on a peer's link.
-    /// Returns the root ConnectionState for the root module, or the
-    /// child's ConnectionState from the modules map.
     pub fn connection_state(&self, peer: &str, module: &str) -> Option<&ConnectionState> {
         let lk = self.links.get(peer)?;
         if lk.state.root.as_deref() == Some(module) {
@@ -116,8 +165,11 @@ impl Node {
         }
     }
 
-    /// Get a mutable ConnectionState for a module on a peer's link.
-    pub fn connection_state_mut(&mut self, peer: &str, module: &str) -> Option<&mut ConnectionState> {
+    pub fn connection_state_mut(
+        &mut self,
+        peer: &str,
+        module: &str,
+    ) -> Option<&mut ConnectionState> {
         let lk = self.links.get_mut(peer)?;
         if lk.state.root.as_deref() == Some(module) {
             Some(&mut lk.state.conn)
@@ -126,13 +178,16 @@ impl Node {
         }
     }
 
-    /// Get the child tracker for a module on a peer (for passing to SyncObjects).
-    pub fn child_tracker(&self, peer: &str, module: &str) -> Option<crate::link::ChildTracker> {
+    pub fn child_tracker(
+        &self,
+        peer: &str,
+        module: &str,
+    ) -> Option<crate::link::ChildTracker> {
         self.connection_state(peer, module)
             .map(|cs| cs.children.clone())
     }
 
-    /// True if name is a declared SO type that can be a root (i.e. is declared).
+    /// True if name is a declared SO type.
     pub fn is_root(&self, name: &str) -> bool {
         self.so_types.contains_key(name)
     }
@@ -144,46 +199,39 @@ impl Node {
             .map_or(false, |cfg| cfg.children.iter().any(|c| c == name))
     }
 
-    /// Get the SoConfig for a declared SO type.
     pub fn so_config(&self, name: &str) -> Option<&SoConfig> {
         self.so_types.get(name)
     }
 
-    /// Get the ConnectMode for a declared SO type (defaults to Invite if undeclared).
     pub fn connect_mode_for(&self, name: &str) -> ConnectMode {
         self.so_types
             .get(name)
             .map_or(ConnectMode::Invite, |cfg| cfg.connect_mode)
     }
 
-    /// Change the ConnectMode for a declared SO type at runtime.
     pub fn set_connect_mode(&mut self, name: &str, mode: ConnectMode) {
         if let Some(cfg) = self.so_types.get_mut(name) {
             cfg.connect_mode = mode;
         }
     }
 
-    /// Get an existing link.
     pub fn get(&self, peer: &str) -> Option<&Link> {
         self.links.get(peer)
     }
 
-    /// Get a mutable reference to an existing link.
     pub fn get_mut(&mut self, peer: &str) -> Option<&mut Link> {
         self.links.get_mut(peer)
     }
 
-    /// Access module map (for cross-module access).
     pub fn module_map(&self) -> &HashMap<String, Box<dyn Module>> {
         &self.modules
     }
 
-    /// Get a mutable reference to a module by name.
     pub fn module_mut(&mut self, name: &str) -> Option<&mut Box<dyn Module>> {
         self.modules.get_mut(name)
     }
 
-    /// Create a new outgoing link to peer running the named root module.
+    /// Create a new outgoing link to peer running the named root SO type.
     pub fn connect(&mut self, peer: &str, root: &str) -> Result<(), SyncError> {
         if !self.is_root(root) {
             return Err(SyncError::Other(format!("unknown root module {:?}", root)));
@@ -233,7 +281,6 @@ impl Node {
         }
     }
 
-    /// True if the module on the peer's link is available.
     pub fn module_available(&self, peer: &str, module: &str) -> bool {
         self.links
             .get(peer)
@@ -242,11 +289,9 @@ impl Node {
 
     /// Unilaterally remove a link.
     pub fn force_remove(&mut self, peer: &str) {
-        // Fire ForceRemove on all connected modules.
         if let Some(lk) = self.links.get(peer) {
             let root = lk.state.root.clone();
             let mod_names: Vec<String> = lk.state.modules.keys().cloned().collect();
-            // Children first, then root.
             for name in &mod_names {
                 if let Some(m) = self.modules.get_mut(name) {
                     m.force_remove(peer);
@@ -257,16 +302,46 @@ impl Node {
                     m.force_remove(peer);
                 }
             }
+            // Also clean up SO handlers for this peer.
+            let so_ids: Vec<u64> = lk.so_table.instances.keys().cloned().collect();
+            for so_id in so_ids {
+                if let Some(mut h) = self.handlers.remove(&(peer.to_string(), so_id)) {
+                    h.force_remove(peer);
+                }
+            }
         }
         self.links.remove(peer);
     }
 
     // -----------------------------------------------------------------------
-    // Child tracker checks — ConnectionState.children per module per peer
+    // SO instance creation — framework creates handlers
     // -----------------------------------------------------------------------
 
-    /// True if any module has connected children (live SyncObjects) for this peer.
-    /// Used to NACK incoming link.close when we still hold refs.
+    /// Create a root SO instance on a link when it connects.
+    fn create_root_so(&mut self, peer: &str, so_type: &str, payload: Option<Value>) {
+        let so_id = self.alloc_so_id();
+        let instance = SoInstance {
+            so_type: so_type.to_string(),
+            parent_id: None,
+            status: ConnectionStatus::Connected,
+            children: Default::default(),
+            intent_close: false,
+        };
+        if let Some(lk) = self.links.get_mut(peer) {
+            lk.so_table.insert(so_id, instance);
+        }
+        // Create handler from factory and call on_connect.
+        if let Some(mut handler) = self.create_handler(so_type) {
+            handler.on_connect(peer, payload);
+            self.handlers
+                .insert((peer.to_string(), so_id), handler);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ref checks
+    // -----------------------------------------------------------------------
+
     fn has_active_refs(&self, peer: &str) -> bool {
         let lk = match self.links.get(peer) {
             Some(lk) => lk,
@@ -280,15 +355,19 @@ impl Node {
                 return true;
             }
         }
+        // Also check SO table.
+        for inst in lk.so_table.instances.values() {
+            if inst.children.has_connected() {
+                return true;
+            }
+        }
         false
     }
 
     // -----------------------------------------------------------------------
-    // Transport auto-connect — set SO connected on bilateral confirmation
+    // Transport auto-connect
     // -----------------------------------------------------------------------
 
-    /// After a successful bilateral response (ok=true), if the queue belongs
-    /// to an Auto-mode SyncObject type, mark it as connected in its parent tracker.
     fn auto_connect_on_response(&self, queue_id: u64, ok: bool, peer: &str) {
         if !ok || queue_id == 0 {
             return;
@@ -300,12 +379,10 @@ impl Node {
                 None => return,
             }
         };
-
         match self.so_types.get(&module_name) {
             Some(cfg) if cfg.connect_mode == ConnectMode::Auto => {}
             _ => return,
         }
-
         if let Some(cs) = self.connection_state(peer, &module_name) {
             if !cs.children.is_connected(queue_id) {
                 cs.children.set_connected(queue_id);
@@ -317,14 +394,31 @@ impl Node {
     // Dispatch — incoming request
     // -----------------------------------------------------------------------
 
-    /// Dispatch an incoming sync request by namespace.
+    /// Dispatch an incoming sync request.
+    /// Routes by so_id for SO instance messages, by namespace for legacy.
     pub fn dispatch_request(
         &mut self,
         peer: &str,
+        so_id: u64,
         full_method: &str,
         payload: Option<Value>,
         ts: i64,
     ) -> Result<bool, SyncError> {
+        // SO-id based routing: if so_id > 0, route to that instance.
+        if so_id > 0 {
+            let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
+            if !lk.so_connected(so_id) {
+                return Err(SyncError::BadMethod);
+            }
+            let key = (peer.to_string(), so_id);
+            let handler = self.handlers.get_mut(&key).ok_or(SyncError::BadMethod)?;
+            match handler.handle_request(peer, full_method, payload, ts) {
+                Ok(r) => return Ok(r.ok),
+                Err(e) => return Err(SyncError::Other(e.to_string())),
+            }
+        }
+
+        // Legacy namespace-based routing for lifecycle and old-style modules.
         let (ns, method) = split_method(full_method);
 
         if ns == "link" {
@@ -333,15 +427,12 @@ impl Node {
         if ns == "module" {
             return self.dispatch_module_request(peer, method, payload);
         }
-        // Application module message.
+        // Application module message (legacy).
         let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
         if !lk.module_connected(ns) {
             return Err(SyncError::BadMethod);
         }
-        let m = self
-            .modules
-            .get_mut(ns)
-            .ok_or(SyncError::BadMethod)?;
+        let m = self.modules.get_mut(ns).ok_or(SyncError::BadMethod)?;
         match m.handle_request(peer, method, payload, ts) {
             Ok(r) => Ok(r.ok),
             Err(e) => Err(SyncError::Other(e.to_string())),
@@ -374,11 +465,9 @@ impl Node {
                 if lk.state.conn.status == Some(ConnectionStatus::Incoming) {
                     return Err(SyncError::Other("link already incoming".into()));
                 }
-                // Root mismatch — NACK.
                 if lk.state.root.as_deref() != Some(name) {
                     return Ok(false);
                 }
-                // Accept: mutual add or Auto mode.
                 let status = lk.state.conn.status.clone();
                 let is_auto = self.connect_mode_for(name) == ConnectMode::Auto;
                 if status == Some(ConnectionStatus::Waiting) || is_auto {
@@ -386,12 +475,14 @@ impl Node {
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
                     let root = lk.state.root.clone().unwrap_or_default();
+                    // Create root SO instance.
+                    self.create_root_so(peer, &root, payload.clone());
+                    // Legacy: also call module on_connect.
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
                         m.on_connect(peer, payload);
                     }
                     return Ok(true);
                 }
-                // Invite mode — mark as incoming, NACK.
                 let lk = self.links.get_mut(peer).unwrap();
                 lk.state.conn.status = Some(ConnectionStatus::Incoming);
                 Ok(false)
@@ -402,7 +493,6 @@ impl Node {
                 }
                 let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
                 if lk.state.conn.status == Some(ConnectionStatus::Connected) {
-                    // OnClose: children first, then root.
                     let mod_names: Vec<String> = lk
                         .state
                         .modules
@@ -411,6 +501,16 @@ impl Node {
                         .map(|(n, _)| n.clone())
                         .collect();
                     let root = lk.state.root.clone().unwrap_or_default();
+                    // Close SO handlers.
+                    let so_ids: Vec<u64> = lk.so_table.instances.keys().cloned().collect();
+                    for so_id in so_ids {
+                        if let Some(mut h) =
+                            self.handlers.remove(&(peer.to_string(), so_id))
+                        {
+                            h.on_close(peer, None);
+                        }
+                    }
+                    // Legacy: close modules.
                     for name in &mod_names {
                         if let Some(m) = self.modules.get_mut(name.as_str()) {
                             m.on_close(peer, None);
@@ -453,17 +553,13 @@ impl Node {
                 if !self.modules.contains_key(name) {
                     return Ok(false);
                 }
-                // Read connect mode before taking mutable borrow.
                 let mode = self.connect_mode_for(name);
-
                 let lk = self.links.get_mut(peer).unwrap();
-                let mod_state = lk.state.modules.entry(name.to_string()).or_default();
-
-                // Already connected — idempotent ACK.
+                let mod_state =
+                    lk.state.modules.entry(name.to_string()).or_default();
                 if mod_state.status == Some(ConnectionStatus::Connected) {
                     return Ok(true);
                 }
-                // Mutual — we also want this module.
                 if mod_state.intent_connect
                     || mod_state.status == Some(ConnectionStatus::Waiting)
                 {
@@ -474,7 +570,6 @@ impl Node {
                     }
                     return Ok(true);
                 }
-                // Auto mode — auto-accept.
                 if mode == ConnectMode::Auto {
                     mod_state.status = Some(ConnectionStatus::Connected);
                     if let Some(m) = self.modules.get_mut(name) {
@@ -482,11 +577,9 @@ impl Node {
                     }
                     return Ok(true);
                 }
-                // Closed — reject.
                 if mode == ConnectMode::Closed {
                     return Ok(false);
                 }
-                // Invite — mark incoming, NACK.
                 mod_state.status = Some(ConnectionStatus::Incoming);
                 Ok(false)
             }
@@ -494,17 +587,21 @@ impl Node {
                 if name.is_empty() || !self.is_child_module(name, &root) {
                     return Ok(false);
                 }
-                // Check for connected children before taking mutable borrow on links.
                 if let Some(cs) = self.connection_state(peer, name) {
                     if cs.children.has_connected() {
                         return Err(SyncError::RefsHeld);
                     }
                 }
                 let lk = self.links.get_mut(peer).unwrap();
-                let was_connected = lk.state.modules.get(name)
-                    .map_or(false, |s| s.status == Some(ConnectionStatus::Connected));
+                let was_connected = lk
+                    .state
+                    .modules
+                    .get(name)
+                    .map_or(false, |s| {
+                        s.status == Some(ConnectionStatus::Connected)
+                    });
                 if !lk.state.modules.contains_key(name) {
-                    return Ok(true); // already gone
+                    return Ok(true);
                 }
                 lk.state.modules.remove(name);
                 if was_connected {
@@ -525,17 +622,26 @@ impl Node {
     // Dispatch — outgoing response
     // -----------------------------------------------------------------------
 
-    /// Dispatch a response to our outgoing message.
     pub fn dispatch_response(
         &mut self,
         peer: &str,
+        so_id: u64,
         full_method: &str,
         payload: Option<Value>,
         ok: bool,
         ts: i64,
     ) {
-        let (ns, method) = split_method(full_method);
+        // SO-id based routing.
+        if so_id > 0 {
+            let key = (peer.to_string(), so_id);
+            if let Some(handler) = self.handlers.get_mut(&key) {
+                handler.handle_response(peer, full_method, payload, ok, ts);
+            }
+            return;
+        }
 
+        // Legacy namespace-based routing.
+        let (ns, method) = split_method(full_method);
         if ns == "link" {
             self.dispatch_link_response(peer, method, payload, ok);
             return;
@@ -544,13 +650,18 @@ impl Node {
             self.dispatch_module_response(peer, method, payload, ok);
             return;
         }
-        // Application module response.
         if let Some(m) = self.modules.get_mut(ns) {
             m.handle_response(peer, method, payload, ok, ts);
         }
     }
 
-    fn dispatch_link_response(&mut self, peer: &str, method: &str, payload: Option<Value>, ok: bool) {
+    fn dispatch_link_response(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: Option<Value>,
+        ok: bool,
+    ) {
         match method {
             "connect" => {
                 let lk = match self.links.get_mut(peer) {
@@ -561,6 +672,9 @@ impl Node {
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
                     let root = lk.state.root.clone().unwrap_or_default();
+                    // Create root SO instance.
+                    self.create_root_so(peer, &root, payload.clone());
+                    // Legacy: also call module on_connect.
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
                         m.on_connect(peer, payload);
                     }
@@ -571,7 +685,6 @@ impl Node {
             }
             "close" => {
                 if ok {
-                    // OnClose: children first, then root.
                     let close_payload = payload;
                     if let Some(lk) = self.links.get(peer) {
                         let mod_names: Vec<String> = lk
@@ -584,6 +697,17 @@ impl Node {
                             .map(|(n, _)| n.clone())
                             .collect();
                         let root = lk.state.root.clone().unwrap_or_default();
+                        // Close SO handlers.
+                        let so_ids: Vec<u64> =
+                            lk.so_table.instances.keys().cloned().collect();
+                        for so_id in so_ids {
+                            if let Some(mut h) =
+                                self.handlers.remove(&(peer.to_string(), so_id))
+                            {
+                                h.on_close(peer, close_payload.clone());
+                            }
+                        }
+                        // Legacy.
                         for name in &mod_names {
                             if let Some(m) = self.modules.get_mut(name.as_str()) {
                                 m.on_close(peer, close_payload.clone());
@@ -619,7 +743,6 @@ impl Node {
         if name.is_empty() {
             return;
         }
-
         match method {
             "connect" => {
                 let lk = match self.links.get_mut(peer) {
@@ -673,8 +796,6 @@ impl Node {
     // Handle incoming — the full sync receive path
     // -----------------------------------------------------------------------
 
-    /// Handle a complete incoming sync request envelope.
-    /// This is the main entry point for the receive side.
     pub fn handle_incoming(&mut self, env: &TxRequest) -> Result<TxResponse, SyncError> {
         let peer = env.from.to_lowercase();
 
@@ -689,7 +810,6 @@ impl Node {
             if env.method != "link.connect" {
                 return Err(SyncError::NoLink);
             }
-            // Validate root SO type name.
             let root_name = env
                 .payload
                 .as_ref()
@@ -702,7 +822,6 @@ impl Node {
                     root_name
                 )));
             }
-            // Check root SO type's connect mode.
             if self.connect_mode_for(root_name) == ConnectMode::Closed {
                 return Ok(TxResponse {
                     ok: false,
@@ -723,16 +842,16 @@ impl Node {
         if let Some(ref resp) = env.resp {
             let lk = self.links.get(&peer).unwrap();
             if lk.pending.is_some() && env.counter == lk.counter + 1 {
-                let lk = self.links.get(&peer).unwrap();
                 lk.validate_timestamp(resp.timestamp, now)?;
 
-                // Extract pending info before mutable borrow.
+                let pending_so_id;
                 let pending_method;
                 let pending_payload;
                 let pending_queue_id;
                 {
                     let lk = self.links.get(&peer).unwrap();
                     let p = lk.pending.as_ref().unwrap();
+                    pending_so_id = p.so_id;
                     pending_method = p.method.clone();
                     pending_payload = p.payload.clone();
                     pending_queue_id = p.queue_id;
@@ -740,17 +859,15 @@ impl Node {
 
                 self.dispatch_response(
                     &peer,
+                    pending_so_id,
                     &pending_method,
                     pending_payload,
                     resp.ok,
                     resp.timestamp,
                 );
 
-                // Transport auto-connect: if this was an ok response to an
-                // Auto-mode SO, mark it connected.
                 self.auto_connect_on_response(pending_queue_id, resp.ok, &peer);
 
-                // Dequeue from registry.
                 if pending_queue_id != 0 {
                     self.registry.lock().unwrap().dequeue(pending_queue_id);
                 }
@@ -769,7 +886,6 @@ impl Node {
             }
         }
 
-        // Determine timestamp.
         let lk = self.links.get(&peer).unwrap();
         let ts = if lk.dominant() {
             let mut t = now;
@@ -781,32 +897,27 @@ impl Node {
             env.timestamp
         };
 
-        // Validate timestamp.
         self.links
             .get(&peer)
             .unwrap()
             .validate_timestamp(ts, now)?;
 
-        // Dispatch request.
-        let ok = self.dispatch_request(&peer, &env.method, env.payload.clone(), ts)?;
+        // Dispatch request with so_id.
+        let ok = self.dispatch_request(&peer, env.so_id, &env.method, env.payload.clone(), ts)?;
 
-        // Accept and return response.
         let lk = self.links.get_mut(&peer).unwrap();
         let response = lk.accept_request(ok, ts);
         Ok(response)
     }
 
     // -----------------------------------------------------------------------
-    // nextTx — collect from lifecycle + module outboxes
+    // nextTx
     // -----------------------------------------------------------------------
 
-    /// Determine the next message to send for this peer.
     pub fn next_tx(&mut self, peer: &str) -> Option<QueuedMsg> {
-        // Phase 1: Mutable link access — cancel opposing intents.
+        // Phase 1: cancel opposing intents.
         {
             let lk = self.links.get_mut(peer)?;
-
-            // Cancel opposing intents on established links.
             if lk.state.conn.intent_close
                 && lk.state.conn.intent_connect
                 && lk.state.conn.status.is_some()
@@ -814,8 +925,6 @@ impl Node {
                 lk.state.conn.intent_close = false;
                 lk.state.conn.intent_connect = false;
             }
-
-            // Module-level opposing intents.
             if lk.state.conn.status == Some(ConnectionStatus::Connected) {
                 for mod_state in lk.state.modules.values_mut() {
                     if mod_state.intent_close
@@ -828,50 +937,57 @@ impl Node {
                 }
             }
         }
-        // Mutable borrow dropped — now we can call &self methods freely.
 
-        // Phase 2: Read link state + ref count checks (immutable).
         let lk = self.links.get(peer)?;
 
-        // Graceful link shutdown: close children individually, then link.
-        if lk.state.conn.intent_close && lk.state.conn.status == Some(ConnectionStatus::Connected) {
-            // Close children one at a time, each waiting for no connected SyncObjects.
+        // Graceful link shutdown.
+        if lk.state.conn.intent_close
+            && lk.state.conn.status == Some(ConnectionStatus::Connected)
+        {
+            // Close SO instances first.
+            for (&so_id, inst) in &lk.so_table.instances {
+                if inst.status == ConnectionStatus::Connected
+                    && !inst.children.has_connected()
+                    && !inst.intent_close
+                {
+                    // TODO: emit SO close message
+                }
+            }
+            // Close legacy modules.
             for (name, mod_state) in &lk.state.modules {
                 if mod_state.status == Some(ConnectionStatus::Connected)
                     && !mod_state.children.has_connected()
                 {
                     return Some(QueuedMsg {
+                        so_id: 0,
                         method: "module.close".into(),
                         payload: Some(serde_json::json!({"name": name})),
                         queued_at: 0,
-                        module: String::new(),
                         queue_id: 0,
                     });
                 }
                 if mod_state.status == Some(ConnectionStatus::Connected) {
-                    return None; // Child still has refs — wait.
+                    return None;
                 }
             }
-            // All children closed. Close link if root has no connected SyncObjects.
             if !lk.state.conn.children.has_connected() {
                 return Some(QueuedMsg {
+                    so_id: 0,
                     method: "link.close".into(),
                     payload: None,
                     queued_at: 0,
-                    module: String::new(),
                     queue_id: 0,
                 });
             }
-            return None; // Root still has refs — wait.
+            return None;
         }
 
-        // Not-yet-connected link closing (e.g. cancel during handshake).
         if lk.state.conn.intent_close {
             return Some(QueuedMsg {
+                so_id: 0,
                 method: "link.close".into(),
                 payload: None,
                 queued_at: 0,
-                module: String::new(),
                 queue_id: 0,
             });
         }
@@ -879,10 +995,10 @@ impl Node {
         if lk.state.conn.intent_connect {
             let root = lk.state.root.clone().unwrap_or_default();
             return Some(QueuedMsg {
+                so_id: 0,
                 method: "link.connect".into(),
                 payload: Some(serde_json::json!({"name": root})),
                 queued_at: 0,
-                module: String::new(),
                 queue_id: 0,
             });
         }
@@ -891,7 +1007,7 @@ impl Node {
             return None;
         }
 
-        // Module close intents (from SetModules, not link-level shutdown).
+        // Module close intents.
         {
             let close_name: Option<String> = lk
                 .state
@@ -905,16 +1021,16 @@ impl Node {
                 .map(|(name, _)| name.clone());
             if let Some(name) = close_name {
                 return Some(QueuedMsg {
+                    so_id: 0,
                     method: "module.close".into(),
                     payload: Some(serde_json::json!({"name": name})),
                     queued_at: 0,
-                    module: String::new(),
                     queue_id: 0,
                 });
             }
         }
 
-        // Collect module connect intents.
+        // Module connect intents.
         let connect_name: Option<String> = lk
             .state
             .modules
@@ -923,15 +1039,15 @@ impl Node {
             .map(|(name, _)| name.clone());
         if let Some(name) = connect_name {
             return Some(QueuedMsg {
+                so_id: 0,
                 method: "module.connect".into(),
                 payload: Some(serde_json::json!({"name": name})),
                 queued_at: 0,
-                module: String::new(),
                 queue_id: 0,
             });
         }
 
-        // Phase 3: Collect from registry outboxes — oldest entry wins.
+        // Collect from registry outboxes — oldest entry wins.
         let connected_modules: Vec<String> = self
             .modules
             .keys()
@@ -944,10 +1060,10 @@ impl Node {
         for mod_name in &connected_modules {
             for candidate in reg.collect_outbox(mod_name, peer) {
                 let msg = QueuedMsg {
+                    so_id: 0, // legacy: no so_id for namespace-routed messages
                     method: format!("{}.{}", mod_name, candidate.method),
                     payload: candidate.payload,
                     queued_at: candidate.queued_at,
-                    module: mod_name.clone(),
                     queue_id: candidate.queue_id,
                 };
                 let is_better = match &best {
@@ -987,6 +1103,7 @@ impl Node {
             from: self.id.clone(),
             to: peer.to_string(),
             counter: lk.counter,
+            so_id: msg.so_id,
             method: msg.method.clone(),
             payload: msg.payload.clone(),
             timestamp: ts,
@@ -998,9 +1115,9 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::{HandleResult, Module};
+    use crate::module::{HandleResult, Module, SoHandler};
 
-    /// Minimal test module that tracks OnConnect/OnClose calls.
+    /// Minimal test module (legacy Module trait).
     struct TestModule {
         connected_peers: Vec<String>,
         closed_peers: Vec<String>,
@@ -1044,6 +1161,52 @@ mod tests {
             self.on_close(peer, None);
         }
         fn reattach_sync_objects(&mut self, _registry: &crate::registry::RegistryRef) {}
+    }
+
+    /// Test SO handler for the new system.
+    struct TestSoHandler {
+        connected: bool,
+        requests: Vec<String>,
+    }
+
+    impl TestSoHandler {
+        fn new() -> Self {
+            TestSoHandler {
+                connected: false,
+                requests: vec![],
+            }
+        }
+    }
+
+    impl SoHandler for TestSoHandler {
+        fn on_connect(&mut self, _peer: &str, _payload: Option<Value>) {
+            self.connected = true;
+        }
+        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {
+            self.connected = false;
+        }
+        fn handle_request(
+            &mut self,
+            _peer: &str,
+            method: &str,
+            _payload: Option<Value>,
+            _ts: i64,
+        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
+            self.requests.push(method.to_string());
+            Ok(HandleResult { ok: true })
+        }
+        fn handle_response(
+            &mut self,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ok: bool,
+            _ts: i64,
+        ) {
+        }
+        fn force_remove(&mut self, peer: &str) {
+            self.on_close(peer, None);
+        }
     }
 
     #[test]
@@ -1105,18 +1268,15 @@ mod tests {
 
     #[test]
     fn bilateral_connect_via_dispatch() {
-        // Alice connects to Bob.
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_root("trustline", vec![]);
         alice.register_module("trustline", Box::new(TestModule::new()));
         alice.connect("bob@b.com", "trustline").unwrap();
 
-        // Alice builds link.connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
         assert_eq!(msg.method, "link.connect");
         let env = alice.build_request("bob@b.com", &msg).unwrap();
 
-        // Bob receives it (Auto mode for auto-accept).
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
@@ -1124,21 +1284,25 @@ mod tests {
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp.ok);
 
-        // Bob's link should be Connected.
         let bob_lk = bob.get("alice@a.com").unwrap();
         assert_eq!(
             bob_lk.state.conn.status,
             Some(ConnectionStatus::Connected)
         );
 
-        // Alice processes response.
         let lk = alice.get_mut("bob@b.com").unwrap();
         lk.pending = Some(msg.clone());
-        alice.dispatch_response("bob@b.com", &msg.method, msg.payload, resp.ok, resp.timestamp);
+        alice.dispatch_response(
+            "bob@b.com",
+            msg.so_id,
+            &msg.method,
+            msg.payload,
+            resp.ok,
+            resp.timestamp,
+        );
         let lk = alice.get_mut("bob@b.com").unwrap();
         lk.accept_response(resp.timestamp);
 
-        // Alice's link should be Connected.
         let alice_lk = alice.get("bob@b.com").unwrap();
         assert_eq!(
             alice_lk.state.conn.status,
@@ -1148,7 +1312,6 @@ mod tests {
 
     #[test]
     fn bilateral_close_via_dispatch() {
-        // Set up connected link.
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
         node.register_module("trustline", Box::new(TestModule::new()));
@@ -1157,13 +1320,41 @@ mod tests {
         lk.state.conn.status = Some(ConnectionStatus::Connected);
         lk.state.conn.intent_connect = false;
 
-        // Close.
         node.close("bob@b.com");
         let msg = node.next_tx("bob@b.com").unwrap();
         assert_eq!(msg.method, "link.close");
 
-        // Simulate OK response.
-        node.dispatch_response("bob@b.com", "link.close", None, true, 100);
-        assert!(node.get("bob@b.com").is_none()); // link removed
+        node.dispatch_response("bob@b.com", 0, "link.close", None, true, 100);
+        assert!(node.get("bob@b.com").is_none());
+    }
+
+    #[test]
+    fn so_handler_factory_creates_on_connect() {
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        // Also register legacy module for the connect handshake.
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+
+        // Bob should have a root SO instance in the table.
+        let bob_lk = bob.get("alice@a.com").unwrap();
+        assert_eq!(bob_lk.so_table.instances.len(), 1);
+        let (_, inst) = bob_lk.so_table.root().unwrap();
+        assert_eq!(inst.so_type, "trustline");
+        assert_eq!(inst.status, ConnectionStatus::Connected);
     }
 }

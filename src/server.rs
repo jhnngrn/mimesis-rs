@@ -698,7 +698,7 @@ impl Server {
 
         loop {
             // Phase 1: Lock, get next message, build envelope, unlock.
-            let (env, _msg_module, msg_queue_id) = {
+            let (env, msg_so_id, msg_queue_id) = {
                 let mut n = node.lock().unwrap();
                 let msg = match n.next_tx(&peer) {
                     Some(m) => m,
@@ -714,6 +714,7 @@ impl Server {
                     from: n.id.clone(),
                     to: peer.clone(),
                     counter: lk.counter,
+                    so_id: msg.so_id,
                     method: msg.method.clone(),
                     payload: msg.payload.clone(),
                     timestamp: 0,
@@ -733,8 +734,8 @@ impl Server {
                     env.resp = Some(cr.clone());
                 }
 
-                let mod_name = msg.module.clone();
-                let q_id = msg.queue_id.clone();
+                let msg_so_id = msg.so_id;
+                let q_id = msg.queue_id;
 
                 // Promote to pending.
                 if let Some(lk) = n.links.get_mut(&peer) {
@@ -746,7 +747,7 @@ impl Server {
                 drop(n);
                 let _ = self.commit_node(&node_id);
 
-                (env, mod_name, q_id)
+                (env, msg_so_id, q_id)
             };
 
             // Phase 2: Send to peer (no lock held).
@@ -797,7 +798,7 @@ impl Server {
                     true // need retry
                 } else {
                     // Dispatch response.
-                    n.dispatch_response(&peer, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
+                    n.dispatch_response(&peer, msg_so_id, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
 
                     // Dequeue from registry.
                     if msg_queue_id != 0 {

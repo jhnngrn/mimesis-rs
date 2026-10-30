@@ -215,6 +215,9 @@ pub struct TxRequest {
     pub from: String,
     pub to: String,
     pub counter: u64,
+    /// Target SO instance ID. 0 = lifecycle (link connect/close).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub so_id: u64,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
@@ -222,6 +225,8 @@ pub struct TxRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resp: Option<TxResponse>,
 }
+
+fn is_zero(v: &u64) -> bool { *v == 0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxResponse {
@@ -244,14 +249,14 @@ pub struct OutboxEntry {
 /// A message selected by nextTx for sending.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMsg {
+    /// Target SO instance bilateral ID.
+    #[serde(default)]
+    pub so_id: u64,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
     #[serde(default)]
     pub queued_at: i64,
-    /// Originating module (for dequeue after response).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub module: String,
     /// Registry queue ID (for dequeue after response).
     #[serde(default)]
     pub queue_id: u64,
@@ -267,6 +272,9 @@ pub const MAX_TIMESTAMP_FUTURE: i64 = 600;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub state: LinkState,
+    /// SO instances on this link, keyed by bilateral ID.
+    #[serde(default)]
+    pub so_table: SoTable,
     pub counter: u64,
     pub turn_bit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +321,7 @@ impl Link {
         let bit = if self_id > peer { 1 } else { 0 };
         Link {
             state: LinkState::default(),
+            so_table: SoTable::new(),
             counter: 0,
             turn_bit: bit,
             pending: None,
@@ -396,6 +405,23 @@ impl Link {
         self.ts = ts;
         self.pending = None;
         resp
+    }
+
+    /// True if an SO instance is connected.
+    pub fn so_connected(&self, so_id: u64) -> bool {
+        self.so_table.get(so_id)
+            .map_or(false, |inst| inst.status == ConnectionStatus::Connected)
+    }
+
+    /// True if an SO instance is connected and not closing.
+    pub fn so_available(&self, so_id: u64) -> bool {
+        if self.state.conn.intent_close {
+            return false;
+        }
+        self.so_table.get(so_id)
+            .map_or(false, |inst| {
+                inst.status == ConnectionStatus::Connected && !inst.intent_close
+            })
     }
 
     /// Finalize a received response to our outgoing message.
