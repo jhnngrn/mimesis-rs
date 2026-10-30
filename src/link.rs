@@ -126,6 +126,76 @@ pub struct ConnectionState {
 
 fn is_false(v: &bool) -> bool { !*v }
 
+// ---------------------------------------------------------------------------
+// SoInstance — a single SO instance on a link, identified by bilateral ID
+// ---------------------------------------------------------------------------
+
+/// A sync object instance on a link. Each has a bilateral ID (the link
+/// counter at connect time), a type name, and an optional parent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoInstance {
+    /// SO type name (e.g. "trustline", "novation").
+    pub so_type: String,
+    /// Parent SO's bilateral ID. None = root SO.
+    pub parent_id: Option<u64>,
+    /// Connection status.
+    pub status: ConnectionStatus,
+    /// Tracks child SO instances.
+    #[serde(skip)]
+    pub children: ChildTracker,
+    /// Whether this SO wants to close.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub intent_close: bool,
+}
+
+/// Table of SO instances on a link, keyed by bilateral ID.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SoTable {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub instances: HashMap<u64, SoInstance>,
+}
+
+impl SoTable {
+    pub fn new() -> Self {
+        SoTable { instances: HashMap::new() }
+    }
+
+    /// Insert a new SO instance. Returns the old one if the ID was taken.
+    pub fn insert(&mut self, so_id: u64, instance: SoInstance) -> Option<SoInstance> {
+        self.instances.insert(so_id, instance)
+    }
+
+    /// Get an SO instance by bilateral ID.
+    pub fn get(&self, so_id: u64) -> Option<&SoInstance> {
+        self.instances.get(&so_id)
+    }
+
+    /// Get a mutable SO instance by bilateral ID.
+    pub fn get_mut(&mut self, so_id: u64) -> Option<&mut SoInstance> {
+        self.instances.get_mut(&so_id)
+    }
+
+    /// Remove an SO instance.
+    pub fn remove(&mut self, so_id: u64) -> Option<SoInstance> {
+        self.instances.remove(&so_id)
+    }
+
+    /// Find the root SO (parent_id = None).
+    pub fn root(&self) -> Option<(u64, &SoInstance)> {
+        self.instances.iter()
+            .find(|(_, inst)| inst.parent_id.is_none())
+            .map(|(&id, inst)| (id, inst))
+    }
+
+    /// All children of a given parent SO.
+    pub fn children_of(&self, parent_id: u64) -> Vec<(u64, &SoInstance)> {
+        self.instances.iter()
+            .filter(|(_, inst)| inst.parent_id == Some(parent_id))
+            .map(|(&id, inst)| (id, inst))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinkState {
     #[serde(flatten)]

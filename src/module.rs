@@ -1,11 +1,12 @@
-//! Module trait — the sync dispatch interface.
+//! SoHandler trait — the sync object dispatch interface.
 //!
-//! A Module is a container that owns SyncObjects for a namespace and
-//! routes sync messages to the right peer's SO. The framework dispatches
-//! by namespace: `trustline.payment` → module "trustline", method "payment".
+//! Every SO type (trustline, triad, novation, ...) implements SoHandler.
+//! The framework dispatches messages directly to SO instances by their
+//! bilateral ID, not by namespace. Each SO instance is an independent
+//! message-receiving object.
 //!
-//! Account API (handle_account, status) is NOT part of this trait —
-//! it's server-level routing, not sync framework.
+//! Account API (handle_account, status) is server-level routing,
+//! not sync framework — handled separately.
 
 use serde_json::Value;
 
@@ -15,20 +16,22 @@ pub struct HandleResult {
     pub ok: bool,
 }
 
-/// Module owns SyncObjects for a namespace and routes sync messages.
+/// Handler for a sync object instance.
 ///
-/// Modules use `SyncObject<T>` for their per-peer state. The framework
-/// collects, dequeues, and kicks automatically via the SyncRegistry.
-pub trait Module: Send + Sync {
-    /// Called when the module becomes bilaterally connected on a link.
-    /// Payload comes from the connects_on method (e.g. commit payload).
+/// Each SO type implements this trait. The framework creates instances
+/// on connect and routes messages to them by so_id. on_connect is the
+/// constructor (called with the connect payload), on_close is the
+/// destructor.
+pub trait SoHandler: Send + Sync {
+    /// Constructor — called when this SO instance is created via connect.
+    /// Payload carries the constructor parameters (e.g. amount for novation).
     fn on_connect(&mut self, peer: &str, payload: Option<Value>);
 
-    /// Called when the module is disconnected from a link.
-    /// Payload comes from the closes_on method (e.g. finalize payload).
+    /// Destructor — called when this SO instance is closed.
+    /// Payload carries the close parameters (e.g. finalize reason).
     fn on_close(&mut self, peer: &str, payload: Option<Value>);
 
-    /// Handle an incoming sync request.
+    /// Handle an incoming sync request routed to this SO instance.
     fn handle_request(
         &mut self,
         peer: &str,
@@ -47,9 +50,30 @@ pub trait Module: Send + Sync {
         ts: i64,
     );
 
-    /// Handle an account API call (local, not sync).
-    /// Default returns error — override in modules that expose account API.
-    /// This is server-level routing, not sync framework, and will move out.
+    /// Unilateral cleanup — called when a link is force-removed.
+    fn force_remove(&mut self, peer: &str);
+}
+
+// Keep Module as a type alias during migration so existing code compiles.
+// TODO: remove once all call sites are migrated.
+pub trait Module: Send + Sync {
+    fn on_connect(&mut self, peer: &str, payload: Option<Value>);
+    fn on_close(&mut self, peer: &str, payload: Option<Value>);
+    fn handle_request(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: Option<Value>,
+        ts: i64,
+    ) -> Result<HandleResult, Box<dyn std::error::Error>>;
+    fn handle_response(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: Option<Value>,
+        ok: bool,
+        ts: i64,
+    );
     fn handle_account(
         &mut self,
         _method: &str,
@@ -57,17 +81,9 @@ pub trait Module: Send + Sync {
     ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
         Err("no account API".into())
     }
-
-    /// Return module status for the account API.
-    /// Default returns None — override in modules that expose status.
     fn status(&self) -> Option<Value> {
         None
     }
-
-    /// Unilateral cleanup — called when a link is force-removed.
     fn force_remove(&mut self, peer: &str);
-
-    /// Reconnect SyncObjects to the registry after deserialization.
-    /// The framework calls this after loading persisted state.
     fn reattach_sync_objects(&mut self, registry: &crate::registry::RegistryRef);
 }
