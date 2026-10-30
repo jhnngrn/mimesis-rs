@@ -143,9 +143,15 @@ pub struct SoInstance {
     /// Tracks child SO instances.
     #[serde(skip)]
     pub children: ChildTracker,
+    /// Whether this SO wants to connect (pending outgoing connect).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub intent_connect: bool,
     /// Whether this SO wants to close.
     #[serde(default, skip_serializing_if = "is_false")]
     pub intent_close: bool,
+    /// Payload for the connect message (used with intent_connect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_payload: Option<serde_json::Value>,
 }
 
 /// Table of SO instances on a link, keyed by bilateral ID.

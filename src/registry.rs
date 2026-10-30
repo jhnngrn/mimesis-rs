@@ -211,6 +211,16 @@ impl SyncRegistry {
         candidates
     }
 
+    /// Find the queue_id for a given SO instance and peer.
+    pub fn find_queue_for_so(&self, so_id: u64, peer: &str) -> Option<u64> {
+        for (&id, sq) in &self.queues {
+            if sq.so_id == so_id && sq.peer == peer {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// True if any queue (any module) has pending entries for this peer.
     pub fn any_pending_for_peer(&self, peer: &str) -> bool {
         self.queues.values().any(|sq| {

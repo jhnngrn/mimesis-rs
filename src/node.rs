@@ -12,7 +12,7 @@ use crate::link::{
     ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
     SyncError, TxRequest, TxResponse, ValidateResult, now_secs,
 };
-use crate::module::{HandleResult, Module, SoHandler};
+use crate::module::{HandleResult, Module, SoContext, SoHandler, SoIntent};
 use crate::registry::{self, RegistryRef};
 
 /// Maximum number of concurrent links per node.
@@ -338,21 +338,86 @@ impl Node {
     /// Create a root SO instance on a link when it connects.
     fn create_root_so(&mut self, peer: &str, so_type: &str, payload: Option<Value>) {
         let so_id = self.alloc_so_id();
+        let mode = self.connect_mode_for(so_type);
+        // Register a queue in the registry for this SO instance.
+        let queue_id = self
+            .registry
+            .lock()
+            .unwrap()
+            .register_so(peer, so_id, so_type, mode);
+
         let instance = SoInstance {
             so_type: so_type.to_string(),
             parent_id: None,
             status: ConnectionStatus::Connected,
             children: Default::default(),
+            intent_connect: false,
             intent_close: false,
+            connect_payload: None,
         };
         if let Some(lk) = self.links.get_mut(peer) {
             lk.so_table.insert(so_id, instance);
         }
-        // Create handler from factory and call on_connect.
+        // Create handler from factory and call on_connect with context.
         if let Some(mut handler) = self.create_handler(so_type) {
-            handler.on_connect(peer, payload);
+            let mut ctx = SoContext::new(so_id, queue_id, peer, self.registry.clone());
+            handler.on_connect(&mut ctx, peer, payload);
+            // Process intents from on_connect.
+            let intents = ctx.drain_intents();
             self.handlers
                 .insert((peer.to_string(), so_id), handler);
+            self.process_intents(peer, so_id, intents);
+        }
+    }
+
+    /// Process intents accumulated by a handler during a dispatch call.
+    fn process_intents(&mut self, peer: &str, parent_so_id: u64, intents: Vec<SoIntent>) {
+        for intent in intents {
+            match intent {
+                SoIntent::ConnectChild { so_type, payload } => {
+                    self.initiate_child_connect(peer, parent_so_id, &so_type, payload);
+                }
+                SoIntent::Close { payload } => {
+                    // Mark the SO for closing — next_tx will emit the close message.
+                    if let Some(lk) = self.links.get_mut(peer) {
+                        if let Some(inst) = lk.so_table.get_mut(parent_so_id) {
+                            inst.intent_close = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initiate child SO creation. Allocates so_id and sets intent_connect.
+    fn initiate_child_connect(
+        &mut self,
+        peer: &str,
+        parent_so_id: u64,
+        so_type: &str,
+        payload: Option<Value>,
+    ) {
+        let child_so_id = self.alloc_so_id();
+
+        // Build connect payload with type and parent info.
+        let mut connect_payload = payload.unwrap_or(serde_json::json!({}));
+        if let Some(obj) = connect_payload.as_object_mut() {
+            obj.insert("so_type".to_string(), serde_json::json!(so_type));
+            obj.insert("parent_id".to_string(), serde_json::json!(parent_so_id));
+        }
+
+        // Create the instance with intent_connect — next_tx will emit the message.
+        let instance = SoInstance {
+            so_type: so_type.to_string(),
+            parent_id: Some(parent_so_id),
+            status: ConnectionStatus::Waiting,
+            children: Default::default(),
+            intent_connect: true,
+            intent_close: false,
+            connect_payload: Some(connect_payload),
+        };
+        if let Some(lk) = self.links.get_mut(peer) {
+            lk.so_table.insert(child_so_id, instance);
         }
     }
 
@@ -428,9 +493,19 @@ impl Node {
             if !lk.so_connected(so_id) {
                 return Err(SyncError::BadMethod);
             }
+            // Find queue_id for this SO instance.
+            let queue_id = {
+                let reg = self.registry.lock().unwrap();
+                reg.find_queue_for_so(so_id, peer).unwrap_or(0)
+            };
+            let registry = self.registry.clone();
             let key = (peer.to_string(), so_id);
             let handler = self.handlers.get_mut(&key).ok_or(SyncError::BadMethod)?;
-            match handler.handle_request(peer, full_method, payload, ts) {
+            let mut ctx = SoContext::new(so_id, queue_id, peer, registry);
+            let result = handler.handle_request(&mut ctx, peer, full_method, payload, ts);
+            let intents = ctx.drain_intents();
+            self.process_intents(peer, so_id, intents);
+            match result {
                 Ok(r) => return Ok(r.ok),
                 Err(e) => return Err(SyncError::Other(e.to_string())),
             }
@@ -651,9 +726,17 @@ impl Node {
     ) {
         // SO-id based routing.
         if so_id > 0 {
+            let queue_id = {
+                let reg = self.registry.lock().unwrap();
+                reg.find_queue_for_so(so_id, peer).unwrap_or(0)
+            };
+            let registry = self.registry.clone();
             let key = (peer.to_string(), so_id);
             if let Some(handler) = self.handlers.get_mut(&key) {
-                handler.handle_response(peer, full_method, payload, ok, ts);
+                let mut ctx = SoContext::new(so_id, queue_id, peer, registry);
+                handler.handle_response(&mut ctx, peer, full_method, payload, ok, ts);
+                let intents = ctx.drain_intents();
+                self.process_intents(peer, so_id, intents);
             }
             return;
         }
@@ -1065,6 +1148,19 @@ impl Node {
             });
         }
 
+        // SO child connect intents.
+        for (&so_id, inst) in &lk.so_table.instances {
+            if inst.intent_connect {
+                return Some(QueuedMsg {
+                    so_id,
+                    method: "connect".into(),
+                    payload: inst.connect_payload.clone(),
+                    queued_at: 0,
+                    queue_id: 0,
+                });
+            }
+        }
+
         // Collect from registry outboxes — oldest entry wins.
         let reg = self.registry.lock().unwrap();
         let mut best: Option<QueuedMsg> = None;
@@ -1204,7 +1300,7 @@ mod tests {
     }
 
     impl SoHandler for TestSoHandler {
-        fn on_connect(&mut self, _peer: &str, _payload: Option<Value>) {
+        fn on_connect(&mut self, _ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {
             self.connected = true;
         }
         fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {
@@ -1212,6 +1308,7 @@ mod tests {
         }
         fn handle_request(
             &mut self,
+            _ctx: &mut SoContext,
             _peer: &str,
             method: &str,
             _payload: Option<Value>,
@@ -1222,6 +1319,7 @@ mod tests {
         }
         fn handle_response(
             &mut self,
+            _ctx: &mut SoContext,
             _peer: &str,
             _method: &str,
             _payload: Option<Value>,
@@ -1359,7 +1457,6 @@ mod tests {
         alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
             Box::new(TestSoHandler::new())
         });
-        // Also register legacy module for the connect handshake.
         alice.register_module("trustline", Box::new(TestModule::new()));
         alice.connect("bob@b.com", "trustline").unwrap();
 
@@ -1381,5 +1478,143 @@ mod tests {
         let (_, inst) = bob_lk.so_table.root().unwrap();
         assert_eq!(inst.so_type, "trustline");
         assert_eq!(inst.status, ConnectionStatus::Connected);
+    }
+
+    /// SO handler that enqueues a response message on connect.
+    struct EnqueueOnConnectHandler;
+
+    impl SoHandler for EnqueueOnConnectHandler {
+        fn on_connect(&mut self, ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {
+            ctx.enqueue("hello", Some(serde_json::json!({"greeting": true})));
+        }
+        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
+        fn handle_request(
+            &mut self,
+            _ctx: &mut SoContext,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ts: i64,
+        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
+            Ok(HandleResult { ok: true })
+        }
+        fn handle_response(
+            &mut self,
+            _ctx: &mut SoContext,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ok: bool,
+            _ts: i64,
+        ) {}
+        fn force_remove(&mut self, _peer: &str) {}
+    }
+
+    #[test]
+    fn so_enqueue_via_context_appears_in_next_tx() {
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(EnqueueOnConnectHandler)
+        });
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Simulate incoming connect from alice.
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_root("trustline", vec![]);
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+
+        // Bob's handler enqueued "hello" on connect.
+        // next_tx should return it routed via the SO's so_id.
+        let next = bob.next_tx("alice@a.com");
+        assert!(next.is_some(), "expected enqueued message from SO handler");
+        let next = next.unwrap();
+        assert_eq!(next.method, "hello");
+        assert!(next.so_id > 0, "SO message should have so_id > 0");
+    }
+
+    /// SO handler that calls connect_child on request.
+    struct ChildSpawnerHandler;
+
+    impl SoHandler for ChildSpawnerHandler {
+        fn on_connect(&mut self, _ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {}
+        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
+        fn handle_request(
+            &mut self,
+            ctx: &mut SoContext,
+            _peer: &str,
+            method: &str,
+            _payload: Option<Value>,
+            _ts: i64,
+        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
+            if method == "spawn" {
+                ctx.connect_child("novation", Some(serde_json::json!({"amount": 100})));
+            }
+            Ok(HandleResult { ok: true })
+        }
+        fn handle_response(
+            &mut self,
+            _ctx: &mut SoContext,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ok: bool,
+            _ts: i64,
+        ) {}
+        fn force_remove(&mut self, _peer: &str) {}
+    }
+
+    #[test]
+    fn connect_child_creates_pending_instance() {
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory(
+            "trustline",
+            SoConfig::auto().with_children(vec!["novation".to_string()]),
+            || Box::new(ChildSpawnerHandler),
+        );
+        bob.declare_so("novation", SoConfig::auto());
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Connect.
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_root("trustline", vec![]);
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+
+        // Get root SO id.
+        let root_so_id = {
+            let lk = bob.get("alice@a.com").unwrap();
+            let (id, _) = lk.so_table.root().unwrap();
+            id
+        };
+
+        // Dispatch a "spawn" request to the root SO.
+        bob.dispatch_request("alice@a.com", root_so_id, "spawn", None, 100)
+            .unwrap();
+
+        // Should now have a child SO instance in Waiting state.
+        let lk = bob.get("alice@a.com").unwrap();
+        assert_eq!(lk.so_table.instances.len(), 2, "root + child");
+        let children = lk.so_table.children_of(root_so_id);
+        assert_eq!(children.len(), 1);
+        let (_, child) = &children[0];
+        assert_eq!(child.so_type, "novation");
+        assert_eq!(child.status, ConnectionStatus::Waiting);
+
+        // next_tx should return the child's connect message.
+        let next = bob.next_tx("alice@a.com");
+        assert!(next.is_some());
+        let next = next.unwrap();
+        assert_eq!(next.method, "connect");
+        assert!(next.so_id > 0);
     }
 }
