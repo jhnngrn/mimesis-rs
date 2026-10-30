@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 
-use crate::link::RefCountHandle;
+use crate::link::RefCount;
 use crate::registry::RegistryRef;
 
 /// SyncObject<T> wraps module data with a registry-managed queue.
@@ -34,7 +34,7 @@ pub struct SyncObject<T> {
     /// Shared reference to the registry.
     registry: Option<RegistryRef>,
     /// Shared ref count on the ConnectionState — decremented on Drop.
-    ref_count: Option<RefCountHandle>,
+    ref_count: Option<RefCount>,
 }
 
 impl<T> SyncObject<T> {
@@ -45,7 +45,7 @@ impl<T> SyncObject<T> {
         peer: &str,
         registry: &RegistryRef,
         module: &str,
-        ref_count: RefCountHandle,
+        ref_count: RefCount,
     ) -> Self {
         let queue_id = registry.lock().unwrap().register(peer, module);
         ref_count.fetch_add(1, Ordering::Relaxed);
@@ -108,7 +108,7 @@ impl<T> SyncObject<T> {
     /// Reconnect to a registry after deserialization.
     /// The queue data should already exist in the registry from persisted state.
     /// The `ref_count` handle comes from the ConnectionState for this module+peer.
-    pub fn reattach(&mut self, registry: &RegistryRef, module: &str, ref_count: RefCountHandle) {
+    pub fn reattach(&mut self, registry: &RegistryRef, module: &str, ref_count: RefCount) {
         registry.lock().unwrap().reattach(self.queue_id, &self.peer, module);
         ref_count.fetch_add(1, Ordering::Relaxed);
         self.registry = Some(registry.clone());
@@ -177,12 +177,12 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::RefCountHandle;
+    use crate::link::RefCount;
     use crate::registry;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    fn make_ref_count() -> RefCountHandle {
+    fn make_ref_count() -> RefCount {
         Arc::new(AtomicUsize::new(0))
     }
 

@@ -23,8 +23,8 @@ pub enum ConnectionStatus {
     Connected,
 }
 
-/// Shared ref count handle. Cloned into SyncObjects so Drop can decrement.
-pub type RefCountHandle = Arc<AtomicUsize>;
+/// Shared ref count. Cloned into SyncObjects so Drop can decrement.
+pub type RefCount = Arc<AtomicUsize>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectionState {
@@ -38,7 +38,7 @@ pub struct ConnectionState {
     /// Managed automatically: incremented on SyncObject creation,
     /// decremented on Drop.
     #[serde(skip)]
-    pub ref_count: RefCountHandle,
+    pub ref_count: RefCount,
 }
 
 fn is_false(v: &bool) -> bool { !*v }
