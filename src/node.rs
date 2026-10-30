@@ -111,7 +111,7 @@ impl Node {
 
     /// Get the ref count for a module on a peer (for passing to SyncObjects).
     /// Creates the ConnectionState entry if it doesn't exist yet.
-    pub fn ref_count(&mut self, peer: &str, module: &str) -> Option<crate::link::RefCount> {
+    pub fn ref_count(&mut self, peer: &str, module: &str) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
         self.connection_state(peer, module)
             .map(|cs| cs.ref_count.clone())
     }
