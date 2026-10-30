@@ -109,11 +109,10 @@ impl Node {
         }
     }
 
-    /// Get the ref count for a module on a peer (for passing to SyncObjects).
-    /// Creates the ConnectionState entry if it doesn't exist yet.
-    pub fn ref_count(&mut self, peer: &str, module: &str) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+    /// Get the child tracker for a module on a peer (for passing to SyncObjects).
+    pub fn child_tracker(&self, peer: &str, module: &str) -> Option<crate::link::ChildTracker> {
         self.connection_state(peer, module)
-            .map(|cs| cs.ref_count.clone())
+            .map(|cs| cs.children.clone())
     }
 
     /// True if name is a declared root module.
@@ -227,21 +226,21 @@ impl Node {
     }
 
     // -----------------------------------------------------------------------
-    // Ref count checks — ConnectionState.ref_count per module per peer
+    // Child tracker checks — ConnectionState.children per module per peer
     // -----------------------------------------------------------------------
 
-    /// True if any module has active refs (live SyncObjects) for this peer.
+    /// True if any module has connected children (live SyncObjects) for this peer.
     /// Used to NACK incoming link.close when we still hold refs.
     fn has_active_refs(&self, peer: &str) -> bool {
         let lk = match self.links.get(peer) {
             Some(lk) => lk,
             None => return false,
         };
-        if lk.state.conn.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        if lk.state.conn.children.has_connected() {
             return true;
         }
         for cs in lk.state.modules.values() {
-            if cs.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            if cs.children.has_connected() {
                 return true;
             }
         }
@@ -422,9 +421,9 @@ impl Node {
                 if name.is_empty() || !self.is_child_module(name, &root) {
                     return Ok(false);
                 }
-                // Check ref count before taking mutable borrow on links.
+                // Check for connected children before taking mutable borrow on links.
                 if let Some(cs) = self.connection_state(peer, name) {
-                    if cs.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    if cs.children.has_connected() {
                         return Err(SyncError::RefsHeld);
                     }
                 }
@@ -757,11 +756,10 @@ impl Node {
 
         // Graceful link shutdown: close children individually, then link.
         if lk.state.conn.intent_close && lk.state.conn.status == Some(ConnectionStatus::Connected) {
-            use std::sync::atomic::Ordering;
-            // Close children one at a time, each waiting for RefCount == 0.
+            // Close children one at a time, each waiting for no connected SyncObjects.
             for (name, mod_state) in &lk.state.modules {
                 if mod_state.status == Some(ConnectionStatus::Connected)
-                    && mod_state.ref_count.load(Ordering::Relaxed) == 0
+                    && !mod_state.children.has_connected()
                 {
                     return Some(QueuedMsg {
                         method: "module.close".into(),
@@ -775,8 +773,8 @@ impl Node {
                     return None; // Child still has refs — wait.
                 }
             }
-            // All children closed. Close link if root RefCount == 0.
-            if lk.state.conn.ref_count.load(Ordering::Relaxed) == 0 {
+            // All children closed. Close link if root has no connected SyncObjects.
+            if !lk.state.conn.children.has_connected() {
                 return Some(QueuedMsg {
                     method: "link.close".into(),
                     payload: None,
@@ -816,7 +814,6 @@ impl Node {
 
         // Module close intents (from SetModules, not link-level shutdown).
         {
-            use std::sync::atomic::Ordering;
             let close_name: Option<String> = lk
                 .state
                 .modules
@@ -824,7 +821,7 @@ impl Node {
                 .find(|(_, s)| {
                     s.intent_close
                         && s.status == Some(ConnectionStatus::Connected)
-                        && s.ref_count.load(Ordering::Relaxed) == 0
+                        && !s.children.has_connected()
                 })
                 .map(|(name, _)| name.clone());
             if let Some(name) = close_name {

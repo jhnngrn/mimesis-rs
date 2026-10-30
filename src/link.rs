@@ -6,9 +6,8 @@
 //! deterministically.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -23,6 +22,67 @@ pub enum ConnectionStatus {
     Connected,
 }
 
+// ---------------------------------------------------------------------------
+// ChildTracker — tracks child SyncObjects and their connected state
+// ---------------------------------------------------------------------------
+
+/// Tracks child SyncObjects registered under a ConnectionState.
+/// Shared (via Arc) between the ConnectionState and its child SyncObjects.
+/// Each child is identified by its queue_id and tracked as connected or not.
+#[derive(Debug, Clone, Default)]
+pub struct ChildTracker {
+    inner: Arc<Mutex<ChildTrackerInner>>,
+}
+
+#[derive(Debug, Default)]
+struct ChildTrackerInner {
+    /// queue_ids of all registered children (connected or not).
+    all: HashSet<u64>,
+    /// queue_ids of connected children only.
+    connected: HashSet<u64>,
+}
+
+impl ChildTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a child (starts as disconnected).
+    pub fn register(&self, queue_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.all.insert(queue_id);
+    }
+
+    /// Unregister a child. Removes from both sets.
+    pub fn unregister(&self, queue_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.all.remove(&queue_id);
+        inner.connected.remove(&queue_id);
+    }
+
+    /// Mark a child as connected.
+    pub fn set_connected(&self, queue_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        debug_assert!(inner.all.contains(&queue_id), "set_connected on unregistered child");
+        inner.connected.insert(queue_id);
+    }
+
+    /// Number of connected children.
+    pub fn connected_count(&self) -> usize {
+        self.inner.lock().unwrap().connected.len()
+    }
+
+    /// True if any child is connected.
+    pub fn has_connected(&self) -> bool {
+        self.connected_count() > 0
+    }
+
+    /// Total number of registered children (connected or not).
+    pub fn total_count(&self) -> usize {
+        self.inner.lock().unwrap().all.len()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectionState {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,11 +91,10 @@ pub struct ConnectionState {
     pub intent_connect: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub intent_close: bool,
-    /// Number of live SyncObjects for this module on this peer.
-    /// Managed automatically: incremented on SyncObject creation,
-    /// decremented on Drop.
+    /// Tracks child SyncObjects — replaces the old atomic ref_count.
+    /// Only connected children block link/module closure.
     #[serde(skip)]
-    pub ref_count: Arc<AtomicUsize>,
+    pub children: ChildTracker,
 }
 
 fn is_false(v: &bool) -> bool { !*v }
