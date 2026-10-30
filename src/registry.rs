@@ -170,6 +170,15 @@ impl SyncRegistry {
         candidates
     }
 
+    /// Return all queue IDs for a module+peer combination.
+    pub fn queues_for(&self, module: &str, peer: &str) -> Vec<u64> {
+        self.queues
+            .iter()
+            .filter(|(_, sq)| sq.module == module && sq.peer == peer)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// True if any queue (any module) has pending entries for this peer.
     pub fn any_pending_for_peer(&self, peer: &str) -> bool {
         self.queues.values().any(|sq| {

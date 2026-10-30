@@ -25,6 +25,11 @@ pub struct SoConfig {
     pub connect_mode: ConnectMode,
     /// Child SO types that can exist under this one.
     pub children: Vec<String>,
+    /// Method that triggers connect on ok response (e.g. "commit").
+    /// None = no method-based connect (only link/module.connect handshake).
+    pub connects_on: Option<String>,
+    /// Methods that trigger close on ok response (e.g. ["finalize", "cancel"]).
+    pub closes_on: Vec<String>,
 }
 
 impl SoConfig {
@@ -32,6 +37,8 @@ impl SoConfig {
         SoConfig {
             connect_mode: ConnectMode::Auto,
             children: vec![],
+            connects_on: None,
+            closes_on: vec![],
         }
     }
 
@@ -39,11 +46,25 @@ impl SoConfig {
         SoConfig {
             connect_mode: ConnectMode::Invite,
             children: vec![],
+            connects_on: None,
+            closes_on: vec![],
         }
     }
 
     pub fn with_children(mut self, children: Vec<String>) -> Self {
         self.children = children;
+        self
+    }
+
+    /// Declare which method triggers connect on ok response.
+    pub fn connects_on(mut self, method: &str) -> Self {
+        self.connects_on = Some(method.to_string());
+        self
+    }
+
+    /// Declare which methods trigger close on ok response.
+    pub fn closes_on(mut self, methods: Vec<&str>) -> Self {
+        self.closes_on = methods.into_iter().map(|s| s.to_string()).collect();
         self
     }
 }
@@ -287,10 +308,11 @@ impl Node {
     // Transport auto-connect — set SO connected on bilateral confirmation
     // -----------------------------------------------------------------------
 
-    /// After a successful bilateral response (ok=true), if the queue belongs
-    /// to an Auto-mode SyncObject type, mark it as connected in its parent tracker.
-    /// This is the "transport service" — modules don't need to call set_connected().
-    fn auto_connect_on_response(&self, queue_id: u64, ok: bool, peer: &str) {
+    /// After a bilateral ok response, handle declarative lifecycle:
+    /// - Auto-mode SOs get connected automatically.
+    /// - `connects_on` method triggers connect.
+    /// - `closes_on` method triggers close (unregister from tracker).
+    fn lifecycle_on_response(&self, queue_id: u64, ok: bool, peer: &str, method: &str) {
         if !ok || queue_id == 0 {
             return;
         }
@@ -302,17 +324,34 @@ impl Node {
             }
         };
 
-        // Check declared SO type for connect mode.
-        match self.so_types.get(&module_name) {
-            Some(cfg) if cfg.connect_mode == ConnectMode::Auto => {}
-            _ => return,
-        }
+        let cfg = match self.so_types.get(&module_name) {
+            Some(cfg) => cfg,
+            None => return,
+        };
 
-        // Find the parent tracker for this module+peer and set connected.
-        if let Some(cs) = self.connection_state(peer, &module_name) {
-            if !cs.children.is_connected(queue_id) {
+        // Extract the sub-method (after the dot): "triad.commit" → "commit"
+        let sub_method = match method.find('.') {
+            Some(i) => &method[i + 1..],
+            None => method,
+        };
+
+        let cs = match self.connection_state(peer, &module_name) {
+            Some(cs) => cs,
+            None => return,
+        };
+
+        // Auto-connect: any ok response connects, OR specific connects_on method.
+        if !cs.children.is_connected(queue_id) {
+            let should_connect = cfg.connect_mode == ConnectMode::Auto
+                || cfg.connects_on.as_deref() == Some(sub_method);
+            if should_connect {
                 cs.children.set_connected(queue_id);
             }
+        }
+
+        // Closes_on: declared method triggers close (unregister from tracker).
+        if cfg.closes_on.iter().any(|m| m == sub_method) {
+            cs.children.unregister(queue_id);
         }
     }
 
@@ -345,10 +384,40 @@ impl Node {
             .modules
             .get_mut(ns)
             .ok_or(SyncError::BadMethod)?;
-        match m.handle_request(peer, method, payload, ts) {
-            Ok(r) => Ok(r.ok),
-            Err(e) => Err(SyncError::Other(e.to_string())),
+        let ok = match m.handle_request(peer, method, payload, ts) {
+            Ok(r) => r.ok,
+            Err(e) => return Err(SyncError::Other(e.to_string())),
+        };
+
+        // Declarative lifecycle on request side (receiver).
+        if ok {
+            if let Some(cfg) = self.so_types.get(ns) {
+                // connects_on: mark all SOs of this type for this peer as connected.
+                if cfg.connects_on.as_deref() == Some(method)
+                    || cfg.connect_mode == ConnectMode::Auto
+                {
+                    if let Some(cs) = self.connection_state(peer, ns) {
+                        let reg = self.registry.lock().unwrap();
+                        for queue_id in reg.queues_for(ns, peer) {
+                            if !cs.children.is_connected(queue_id) {
+                                cs.children.set_connected(queue_id);
+                            }
+                        }
+                    }
+                }
+                // closes_on: unregister SOs of this type for this peer.
+                if cfg.closes_on.iter().any(|m| m == method) {
+                    if let Some(cs) = self.connection_state(peer, ns) {
+                        let reg = self.registry.lock().unwrap();
+                        for queue_id in reg.queues_for(ns, peer) {
+                            cs.children.unregister(queue_id);
+                        }
+                    }
+                }
+            }
         }
+
+        Ok(ok)
     }
 
     fn dispatch_link_request(
@@ -748,9 +817,8 @@ impl Node {
                     resp.timestamp,
                 );
 
-                // Transport auto-connect: if this was an ok response to an
-                // Auto-mode SO, mark it connected before dequeue removes it.
-                self.auto_connect_on_response(pending_queue_id, resp.ok, &peer);
+                // Declarative lifecycle: connect/close based on SoConfig.
+                self.lifecycle_on_response(pending_queue_id, resp.ok, &peer, &pending_method);
 
                 // Dequeue from registry.
                 if pending_queue_id != 0 {
