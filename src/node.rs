@@ -33,6 +33,36 @@ impl Default for InviteMode {
     }
 }
 
+/// Configuration for a declared SyncObject type.
+#[derive(Debug, Clone)]
+pub struct SoConfig {
+    /// How this SO type connects (Auto or Invite).
+    pub connect_mode: ConnectMode,
+    /// Child SO types that can exist under this one.
+    pub children: Vec<String>,
+}
+
+impl SoConfig {
+    pub fn auto() -> Self {
+        SoConfig {
+            connect_mode: ConnectMode::Auto,
+            children: vec![],
+        }
+    }
+
+    pub fn invite() -> Self {
+        SoConfig {
+            connect_mode: ConnectMode::Invite,
+            children: vec![],
+        }
+    }
+
+    pub fn with_children(mut self, children: Vec<String>) -> Self {
+        self.children = children;
+        self
+    }
+}
+
 /// Split "trustline.payment" → ("trustline", "payment").
 /// If no dot, returns ("", method).
 fn split_method(method: &str) -> (&str, &str) {
@@ -49,9 +79,9 @@ pub struct Node {
     pub links: HashMap<String, Link>,
     #[serde(default)]
     pub invite_mode: InviteMode,
-    /// Root module declarations: root name → child module names.
+    /// Declared SO types and their configuration.
     #[serde(skip)]
-    roots: HashMap<String, Vec<String>>,
+    so_types: HashMap<String, SoConfig>,
     /// Registered modules by name.
     #[serde(skip)]
     modules: HashMap<String, Box<dyn Module>>,
@@ -66,15 +96,20 @@ impl Node {
             id,
             links: HashMap::new(),
             invite_mode: InviteMode::default(),
-            roots: HashMap::new(),
+            so_types: HashMap::new(),
             modules: HashMap::new(),
             registry: registry::new_registry(),
         }
     }
 
-    /// Declare a root module with its child modules.
+    /// Declare a SyncObject type with its configuration.
+    pub fn declare_so(&mut self, name: &str, config: SoConfig) {
+        self.so_types.insert(name.to_string(), config);
+    }
+
+    /// Backwards-compatible: declare a root with children (all Auto mode).
     pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
-        self.roots.insert(name.to_string(), children);
+        self.so_types.insert(name.to_string(), SoConfig::auto().with_children(children));
     }
 
     /// Register a module instance.
@@ -115,16 +150,21 @@ impl Node {
             .map(|cs| cs.children.clone())
     }
 
-    /// True if name is a declared root module.
+    /// True if name is a declared SO type that can be a root (i.e. is declared).
     pub fn is_root(&self, name: &str) -> bool {
-        self.roots.contains_key(name)
+        self.so_types.contains_key(name)
     }
 
-    /// True if name is a child of the given root.
-    pub fn is_child_module(&self, name: &str, root: &str) -> bool {
-        self.roots
-            .get(root)
-            .map_or(false, |children| children.iter().any(|c| c == name))
+    /// True if name is a declared child of the given parent SO type.
+    pub fn is_child_module(&self, name: &str, parent: &str) -> bool {
+        self.so_types
+            .get(parent)
+            .map_or(false, |cfg| cfg.children.iter().any(|c| c == name))
+    }
+
+    /// Get the SoConfig for a declared SO type.
+    pub fn so_config(&self, name: &str) -> Option<&SoConfig> {
+        self.so_types.get(name)
     }
 
     /// Get an existing link.
@@ -252,22 +292,25 @@ impl Node {
     // -----------------------------------------------------------------------
 
     /// After a successful bilateral response (ok=true), if the queue belongs
-    /// to an Auto-mode SyncObject, mark it as connected in its parent tracker.
+    /// to an Auto-mode SyncObject type, mark it as connected in its parent tracker.
     /// This is the "transport service" — modules don't need to call set_connected().
     fn auto_connect_on_response(&self, queue_id: u64, ok: bool, peer: &str) {
         if !ok || queue_id == 0 {
             return;
         }
-        let reg = self.registry.lock().unwrap();
-        let queue = match reg.get_queue(queue_id) {
-            Some(q) => q,
-            None => return,
+        let module_name = {
+            let reg = self.registry.lock().unwrap();
+            match reg.get_queue(queue_id) {
+                Some(q) => q.module.clone(),
+                None => return,
+            }
         };
-        if queue.connect_mode != ConnectMode::Auto {
-            return;
+
+        // Check declared SO type for connect mode.
+        match self.so_types.get(&module_name) {
+            Some(cfg) if cfg.connect_mode == ConnectMode::Auto => {}
+            _ => return,
         }
-        let module_name = queue.module.clone();
-        drop(reg); // Release lock before accessing link state.
 
         // Find the parent tracker for this module+peer and set connected.
         if let Some(cs) = self.connection_state(peer, &module_name) {
