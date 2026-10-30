@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::link::{
-    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
+    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoChild, SoInstance,
     SyncError, TxRequest, TxResponse, ValidateResult, now_secs,
 };
 use crate::module::{HandleResult, Module, SoContext, SoHandler, SoIntent};
@@ -351,6 +351,7 @@ impl Node {
             parent_id: None,
             status: ConnectionStatus::Connected,
             children: Default::default(),
+            so_children: Vec::new(),
             intent_connect: false,
             intent_close: false,
             connect_payload: None,
@@ -376,6 +377,22 @@ impl Node {
             match intent {
                 SoIntent::ConnectChild { so_type, payload } => {
                     self.initiate_child_connect(peer, parent_so_id, &so_type, payload);
+                }
+                SoIntent::CreateChild { so_type, method, payload } => {
+                    // Add a pending child to the parent's so_children list.
+                    // so_id: None — will be derived from the link counter
+                    // after the creating transaction succeeds.
+                    if let Some(lk) = self.links.get_mut(peer) {
+                        if let Some(inst) = lk.so_table.get_mut(parent_so_id) {
+                            inst.so_children.push(SoChild {
+                                so_id: None,
+                                so_type,
+                                status: None,
+                                method,
+                                payload,
+                            });
+                        }
+                    }
                 }
                 SoIntent::Close { payload } => {
                     // Mark the SO for closing — next_tx will emit the close message.
@@ -412,12 +429,37 @@ impl Node {
             parent_id: Some(parent_so_id),
             status: ConnectionStatus::Waiting,
             children: Default::default(),
+            so_children: Vec::new(),
             intent_connect: true,
             intent_close: false,
             connect_payload: Some(connect_payload),
         };
         if let Some(lk) = self.links.get_mut(peer) {
             lk.so_table.insert(child_so_id, instance);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending child finalization — assign so_id = counter after transaction
+    // -----------------------------------------------------------------------
+
+    /// After a successful transaction, assign so_id to any pending child
+    /// that was in Waiting state (sent but not yet confirmed).
+    /// Both sender and receiver call this with the same counter value,
+    /// so both sides derive the same child so_id.
+    fn finalize_pending_children(&mut self, peer: &str, tx_counter: u64) {
+        if let Some(lk) = self.links.get_mut(peer) {
+            for inst in lk.so_table.instances.values_mut() {
+                for child in inst.so_children.iter_mut() {
+                    if child.so_id.is_none()
+                        && child.status == Some(ConnectionStatus::Waiting)
+                    {
+                        child.so_id = Some(tx_counter);
+                        child.status = Some(ConnectionStatus::Connected);
+                        return; // one at a time
+                    }
+                }
+            }
         }
     }
 
@@ -973,8 +1015,15 @@ impl Node {
                     self.registry.lock().unwrap().dequeue(pending_queue_id);
                 }
 
-                let lk = self.links.get_mut(&peer).unwrap();
-                lk.accept_response(resp.timestamp);
+                let piggybacked_counter = {
+                    let lk = self.links.get_mut(&peer).unwrap();
+                    let counter = lk.counter;
+                    lk.accept_response(resp.timestamp);
+                    counter
+                };
+                if resp.ok {
+                    self.finalize_pending_children(&peer, piggybacked_counter);
+                }
             }
         }
 
@@ -1006,8 +1055,17 @@ impl Node {
         // Dispatch request with so_id.
         let ok = self.dispatch_request(&peer, env.so_id, &env.method, env.payload.clone(), ts)?;
 
-        let lk = self.links.get_mut(&peer).unwrap();
-        let response = lk.accept_request(ok, ts);
+        let (tx_counter, response) = {
+            let lk = self.links.get_mut(&peer).unwrap();
+            let counter = lk.counter;
+            let response = lk.accept_request(ok, ts);
+            (counter, response)
+        };
+
+        if response.ok {
+            self.finalize_pending_children(&peer, tx_counter);
+        }
+
         Ok(response)
     }
 
@@ -1148,7 +1206,7 @@ impl Node {
             });
         }
 
-        // SO child connect intents.
+        // SO child connect intents (legacy — SoInstance with intent_connect).
         for (&so_id, inst) in &lk.so_table.instances {
             if inst.intent_connect {
                 return Some(QueuedMsg {
@@ -1160,6 +1218,28 @@ impl Node {
                 });
             }
         }
+
+        // Pending child SO creates — children with so_id: None, status: None.
+        // Emit message with PARENT's so_id (routes to parent on receiver).
+        // Child's so_id = counter, derived after the transaction succeeds.
+        {
+            let lk = self.links.get_mut(peer)?;
+            for (&parent_so_id, inst) in lk.so_table.instances.iter_mut() {
+                for child in inst.so_children.iter_mut() {
+                    if child.so_id.is_none() && child.status.is_none() {
+                        child.status = Some(ConnectionStatus::Waiting);
+                        return Some(QueuedMsg {
+                            so_id: parent_so_id,
+                            method: child.method.clone(),
+                            payload: child.payload.clone(),
+                            queued_at: 0,
+                            queue_id: 0,
+                        });
+                    }
+                }
+            }
+        }
+        let lk = self.links.get(peer)?;
 
         // Collect from registry outboxes — oldest entry wins.
         let reg = self.registry.lock().unwrap();
@@ -1538,7 +1618,86 @@ mod tests {
         assert!(next.so_id > 0, "SO message should have so_id > 0");
     }
 
-    /// SO handler that calls connect_child on request.
+    /// SO handler that calls create_child (new path) on request.
+    struct CreateChildHandler;
+
+    impl SoHandler for CreateChildHandler {
+        fn on_connect(&mut self, _ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {}
+        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
+        fn handle_request(
+            &mut self,
+            ctx: &mut SoContext,
+            _peer: &str,
+            method: &str,
+            payload: Option<Value>,
+            _ts: i64,
+        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
+            if method == "do_create" {
+                ctx.create_child("novation", "commit", payload);
+            }
+            Ok(HandleResult { ok: true })
+        }
+        fn handle_response(
+            &mut self,
+            _ctx: &mut SoContext,
+            _peer: &str,
+            _method: &str,
+            _payload: Option<Value>,
+            _ok: bool,
+            _ts: i64,
+        ) {}
+        fn force_remove(&mut self, _peer: &str) {}
+    }
+
+    #[test]
+    fn create_child_adds_pending_child_to_parent() {
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(CreateChildHandler)
+        });
+        bob.declare_so("novation", SoConfig::auto());
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Connect.
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_root("trustline", vec![]);
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+
+        // Get root SO id.
+        let root_so_id = {
+            let lk = bob.get("alice@a.com").unwrap();
+            let (id, _) = lk.so_table.root().unwrap();
+            id
+        };
+
+        // Dispatch "do_create" — handler calls ctx.create_child().
+        bob.dispatch_request(
+            "alice@a.com", root_so_id, "do_create",
+            Some(serde_json::json!({"amount": 50})), 100,
+        ).unwrap();
+
+        // Parent should now have a pending child.
+        let lk = bob.get("alice@a.com").unwrap();
+        let root = lk.so_table.get(root_so_id).unwrap();
+        assert_eq!(root.so_children.len(), 1);
+        let child = &root.so_children[0];
+        assert!(child.so_id.is_none());
+        assert!(child.status.is_none());
+        assert_eq!(child.so_type, "novation");
+        assert_eq!(child.method, "commit");
+
+        // next_tx should emit the creating message with parent's so_id.
+        let next = bob.next_tx("alice@a.com").unwrap();
+        assert_eq!(next.so_id, root_so_id);
+        assert_eq!(next.method, "commit");
+    }
+
+    /// SO handler that calls connect_child on request (legacy path).
     struct ChildSpawnerHandler;
 
     impl SoHandler for ChildSpawnerHandler {
@@ -1616,5 +1775,162 @@ mod tests {
         let next = next.unwrap();
         assert_eq!(next.method, "connect");
         assert!(next.so_id > 0);
+    }
+
+    #[test]
+    fn pending_child_routes_via_parent_so_id() {
+        use crate::link::SoChild;
+
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Connect alice → bob.
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_root("trustline", vec![]);
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+
+        // Get root SO id on bob.
+        let root_so_id = {
+            let lk = bob.get("alice@a.com").unwrap();
+            let (id, _) = lk.so_table.root().unwrap();
+            id
+        };
+
+        // Add a pending child (so_id: None, status: None) to the root SO.
+        {
+            let lk = bob.get_mut("alice@a.com").unwrap();
+            let root = lk.so_table.get_mut(root_so_id).unwrap();
+            root.so_children.push(SoChild {
+                so_id: None,
+                so_type: "novation".into(),
+                status: None,
+                method: "commit".into(),
+                payload: Some(serde_json::json!({"amount": 100})),
+            });
+        }
+
+        // next_tx should pick up the pending child.
+        // The message should use PARENT's so_id (not allocate a new one).
+        let next = bob.next_tx("alice@a.com");
+        assert!(next.is_some());
+        let next = next.unwrap();
+        assert_eq!(next.method, "commit");
+        assert_eq!(next.so_id, root_so_id, "creating message routes via parent's so_id");
+
+        // The child should still have so_id: None but status: Waiting.
+        let lk = bob.get("alice@a.com").unwrap();
+        let root = lk.so_table.get(root_so_id).unwrap();
+        let child = &root.so_children[0];
+        assert!(child.so_id.is_none(), "so_id not assigned yet — derived from counter after tx");
+        assert_eq!(child.status, Some(ConnectionStatus::Waiting));
+    }
+
+    #[test]
+    fn child_so_id_equals_counter_after_transaction() {
+        use crate::link::SoChild;
+
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Bilateral connect.
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let resp = bob.handle_incoming(&env).unwrap();
+        assert!(resp.ok);
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.pending = Some(msg.clone());
+        }
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.ok, resp.timestamp);
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.accept_response(resp.timestamp);
+        }
+
+        // Get root SO id on alice.
+        let root_so_id = {
+            let lk = alice.get("bob@b.com").unwrap();
+            let (id, _) = lk.so_table.root().unwrap();
+            id
+        };
+
+        // Add a pending child on alice.
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            let root = lk.so_table.get_mut(root_so_id).unwrap();
+            root.so_children.push(SoChild {
+                so_id: None,
+                so_type: "novation".into(),
+                status: None,
+                method: "commit".into(),
+                payload: Some(serde_json::json!({"amount": 100})),
+            });
+        }
+
+        // next_tx emits the creating message with parent's so_id.
+        let creating_msg = alice.next_tx("bob@b.com").unwrap();
+        assert_eq!(creating_msg.so_id, root_so_id);
+        assert_eq!(creating_msg.method, "commit");
+
+        // Record the counter BEFORE the transaction.
+        let tx_counter = alice.get("bob@b.com").unwrap().counter;
+
+        // Build and send to bob.
+        let env = alice.build_request("bob@b.com", &creating_msg).unwrap();
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.pending = Some(creating_msg.clone());
+        }
+
+        // Bob receives — handle_incoming calls finalize_pending_children.
+        // Bob's parent handler gets the request but doesn't create a child
+        // (that's app-level logic, not tested here). The receiver-side
+        // finalization only fires if the receiver also has a pending child.
+        let bob_resp = bob.handle_incoming(&env).unwrap();
+        assert!(bob_resp.ok);
+
+        // Alice processes the response — finalize_pending_children assigns
+        // child.so_id = tx_counter.
+        alice.dispatch_response(
+            "bob@b.com",
+            creating_msg.so_id,
+            &creating_msg.method,
+            creating_msg.payload,
+            bob_resp.ok,
+            bob_resp.timestamp,
+        );
+        // Simulate accept_response + finalize (normally in handle_incoming
+        // for piggybacked responses, here we do it manually).
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.accept_response(bob_resp.timestamp);
+        }
+        // Call finalize manually since we're outside handle_incoming.
+        alice.finalize_pending_children("bob@b.com", tx_counter);
+
+        // Verify: child.so_id = tx_counter.
+        let lk = alice.get("bob@b.com").unwrap();
+        let root = lk.so_table.get(root_so_id).unwrap();
+        let child = &root.so_children[0];
+        assert_eq!(child.so_id, Some(tx_counter), "child so_id should equal the transaction counter");
+        assert_eq!(child.status, Some(ConnectionStatus::Connected));
     }
 }

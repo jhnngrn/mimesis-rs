@@ -130,6 +130,30 @@ fn is_false(v: &bool) -> bool { !*v }
 // SoInstance — a single SO instance on a link, identified by bilateral ID
 // ---------------------------------------------------------------------------
 
+/// A child SO at any lifecycle stage.
+///
+/// - `so_id: None` → pending, not yet sent (lives in parent's children list)
+/// - `so_id: Some(id), status: None` → allocated but not bilateral yet
+/// - `so_id: Some(id), status: Some(Waiting)` → sent, waiting for ACK
+/// - `so_id: Some(id), status: Some(Connected)` → bilateral, active
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoChild {
+    /// Bilateral ID. None = pending, not yet allocated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub so_id: Option<u64>,
+    /// SO type name (e.g. "novation").
+    pub so_type: String,
+    /// Connection status. None = not yet bilateral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ConnectionStatus>,
+    /// Method to send as the creating message (e.g. "commit").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    /// Payload for the creating message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
 /// A sync object instance on a link. Each has a bilateral ID (the link
 /// counter at connect time), a type name, and an optional parent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,9 +164,12 @@ pub struct SoInstance {
     pub parent_id: Option<u64>,
     /// Connection status.
     pub status: ConnectionStatus,
-    /// Tracks child SO instances.
+    /// Tracks child SO instances (legacy ref counting).
     #[serde(skip)]
     pub children: ChildTracker,
+    /// Child SOs at all lifecycle stages (pending through connected).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub so_children: Vec<SoChild>,
     /// Whether this SO wants to connect (pending outgoing connect).
     #[serde(default, skip_serializing_if = "is_false")]
     pub intent_connect: bool,

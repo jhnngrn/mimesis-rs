@@ -30,9 +30,17 @@ pub struct HandleResult {
 /// The framework drains these after the handler returns.
 #[derive(Debug, Clone)]
 pub enum SoIntent {
-    /// Create a child SO instance.
+    /// Create a child SO instance (legacy — allocates so_id immediately).
     ConnectChild {
         so_type: String,
+        payload: Option<Value>,
+    },
+    /// Create a child SO via the pending-child path.
+    /// The creating message goes out with parent's so_id on wire.
+    /// Child gets so_id = counter after the transaction succeeds.
+    CreateChild {
+        so_type: String,
+        method: String,
         payload: Option<Value>,
     },
     /// Close this SO instance.
@@ -83,11 +91,25 @@ impl SoContext {
             .enqueue(self.queue_id, method, payload);
     }
 
-    /// Request a child SO to be created under this one.
-    /// The framework allocates the so_id and sends the connect message.
+    /// Request a child SO to be created under this one (legacy path).
+    /// The framework allocates the so_id immediately and sends a connect message.
     pub fn connect_child(&mut self, so_type: &str, payload: Option<Value>) {
         self.intents.push(SoIntent::ConnectChild {
             so_type: so_type.to_string(),
+            payload,
+        });
+    }
+
+    /// Create a child SO via the pending-child path.
+    ///
+    /// The creating message goes out as a regular message to the parent
+    /// (using parent's so_id on wire). The child's so_id is derived from
+    /// the link counter at transaction time — both sides derive the same
+    /// value, nothing extra on wire.
+    pub fn create_child(&mut self, so_type: &str, method: &str, payload: Option<Value>) {
+        self.intents.push(SoIntent::CreateChild {
+            so_type: so_type.to_string(),
+            method: method.to_string(),
             payload,
         });
     }
