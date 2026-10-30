@@ -459,7 +459,7 @@ impl Node {
                     lk.state.conn.intent_connect = false;
                     let root = lk.state.root.clone().unwrap_or_default();
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        m.on_connect(peer);
+                        m.on_connect(peer, payload);
                     }
                     return Ok(true);
                 }
@@ -485,11 +485,11 @@ impl Node {
                     let root = lk.state.root.clone().unwrap_or_default();
                     for name in &mod_names {
                         if let Some(m) = self.modules.get_mut(name.as_str()) {
-                            m.on_close(peer);
+                            m.on_close(peer, None);
                         }
                     }
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        m.on_close(peer);
+                        m.on_close(peer, None);
                     }
                 }
                 self.links.remove(peer);
@@ -542,7 +542,7 @@ impl Node {
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
                     if let Some(m) = self.modules.get_mut(name) {
-                        m.on_connect(peer);
+                        m.on_connect(peer, payload);
                     }
                     return Ok(true);
                 }
@@ -550,7 +550,7 @@ impl Node {
                 if mode == ConnectMode::Auto {
                     mod_state.status = Some(ConnectionStatus::Connected);
                     if let Some(m) = self.modules.get_mut(name) {
-                        m.on_connect(peer);
+                        m.on_connect(peer, payload);
                     }
                     return Ok(true);
                 }
@@ -581,7 +581,7 @@ impl Node {
                 lk.state.modules.remove(name);
                 if was_connected {
                     if let Some(m) = self.modules.get_mut(name) {
-                        m.on_close(peer);
+                        m.on_close(peer, payload);
                     }
                 }
                 Ok(true)
@@ -609,7 +609,7 @@ impl Node {
         let (ns, method) = split_method(full_method);
 
         if ns == "link" {
-            self.dispatch_link_response(peer, method, ok);
+            self.dispatch_link_response(peer, method, payload, ok);
             return;
         }
         if ns == "module" {
@@ -622,7 +622,7 @@ impl Node {
         }
     }
 
-    fn dispatch_link_response(&mut self, peer: &str, method: &str, ok: bool) {
+    fn dispatch_link_response(&mut self, peer: &str, method: &str, payload: Option<Value>, ok: bool) {
         match method {
             "connect" => {
                 let lk = match self.links.get_mut(peer) {
@@ -634,7 +634,7 @@ impl Node {
                     lk.state.conn.intent_connect = false;
                     let root = lk.state.root.clone().unwrap_or_default();
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        m.on_connect(peer);
+                        m.on_connect(peer, payload);
                     }
                 } else {
                     lk.state.conn.status = Some(ConnectionStatus::Waiting);
@@ -644,6 +644,7 @@ impl Node {
             "close" => {
                 if ok {
                     // OnClose: children first, then root.
+                    let close_payload = payload;
                     if let Some(lk) = self.links.get(peer) {
                         let mod_names: Vec<String> = lk
                             .state
@@ -657,11 +658,11 @@ impl Node {
                         let root = lk.state.root.clone().unwrap_or_default();
                         for name in &mod_names {
                             if let Some(m) = self.modules.get_mut(name.as_str()) {
-                                m.on_close(peer);
+                                m.on_close(peer, close_payload.clone());
                             }
                         }
                         if let Some(m) = self.modules.get_mut(root.as_str()) {
-                            m.on_close(peer);
+                            m.on_close(peer, close_payload);
                         }
                     }
                     self.links.remove(peer);
@@ -705,7 +706,7 @@ impl Node {
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
                     if let Some(m) = self.modules.get_mut(name) {
-                        m.on_connect(peer);
+                        m.on_connect(peer, payload);
                     }
                 } else {
                     mod_state.status = Some(ConnectionStatus::Waiting);
@@ -727,7 +728,7 @@ impl Node {
                     lk.state.modules.remove(name);
                     if was_connected {
                         if let Some(m) = self.modules.get_mut(name) {
-                            m.on_close(peer);
+                            m.on_close(peer, payload);
                         }
                     }
                 } else {
@@ -1086,10 +1087,10 @@ mod tests {
     }
 
     impl Module for TestModule {
-        fn on_connect(&mut self, peer: &str) {
+        fn on_connect(&mut self, peer: &str, _payload: Option<Value>) {
             self.connected_peers.push(peer.to_string());
         }
-        fn on_close(&mut self, peer: &str) {
+        fn on_close(&mut self, peer: &str, _payload: Option<Value>) {
             self.closed_peers.push(peer.to_string());
         }
         fn handle_request(
@@ -1110,18 +1111,8 @@ mod tests {
             _ts: i64,
         ) {
         }
-        fn handle_account(
-            &mut self,
-            _method: &str,
-            _payload: Option<Value>,
-        ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
-            Err("unknown method".into())
-        }
-        fn status(&self) -> Option<Value> {
-            None
-        }
         fn force_remove(&mut self, peer: &str) {
-            self.on_close(peer);
+            self.on_close(peer, None);
         }
         fn reattach_sync_objects(&mut self, _registry: &crate::registry::RegistryRef) {}
     }

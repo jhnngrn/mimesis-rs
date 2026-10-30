@@ -1,11 +1,11 @@
-//! Module trait — the application interface.
+//! Module trait — the sync dispatch interface.
 //!
-//! Modules implement sync methods and account API calls. The framework
-//! dispatches by namespace: `trustline.payment` → module "trustline",
-//! method "payment".
+//! A Module is a container that owns SyncObjects for a namespace and
+//! routes sync messages to the right peer's SO. The framework dispatches
+//! by namespace: `trustline.payment` → module "trustline", method "payment".
 //!
-//! Outbox management (collect_outbox, dequeue, outbox_has) is handled
-//! entirely by the SyncRegistry — modules don't touch it.
+//! Account API (handle_account, status) is NOT part of this trait —
+//! it's server-level routing, not sync framework.
 
 use serde_json::Value;
 
@@ -15,18 +15,18 @@ pub struct HandleResult {
     pub ok: bool,
 }
 
-/// Module processes sync methods and account API calls for a namespace.
+/// Module owns SyncObjects for a namespace and routes sync messages.
 ///
-/// In Rust-mimesis, modules use `SyncObject<T>` for their per-peer state.
-/// SyncObjects register queues in the framework's SyncRegistry — the
-/// framework collects, dequeues, and kicks automatically. Modules just
-/// call `sync_object.send()` inside handlers.
+/// Modules use `SyncObject<T>` for their per-peer state. The framework
+/// collects, dequeues, and kicks automatically via the SyncRegistry.
 pub trait Module: Send + Sync {
     /// Called when the module becomes bilaterally connected on a link.
-    fn on_connect(&mut self, peer: &str);
+    /// Payload comes from the connects_on method (e.g. commit payload).
+    fn on_connect(&mut self, peer: &str, payload: Option<Value>);
 
     /// Called when the module is disconnected from a link.
-    fn on_close(&mut self, peer: &str);
+    /// Payload comes from the closes_on method (e.g. finalize payload).
+    fn on_close(&mut self, peer: &str, payload: Option<Value>);
 
     /// Handle an incoming sync request.
     fn handle_request(
@@ -48,14 +48,21 @@ pub trait Module: Send + Sync {
     );
 
     /// Handle an account API call (local, not sync).
+    /// Default returns error — override in modules that expose account API.
+    /// This is server-level routing, not sync framework, and will move out.
     fn handle_account(
         &mut self,
-        method: &str,
-        payload: Option<Value>,
-    ) -> Result<Option<Value>, Box<dyn std::error::Error>>;
+        _method: &str,
+        _payload: Option<Value>,
+    ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+        Err("no account API".into())
+    }
 
     /// Return module status for the account API.
-    fn status(&self) -> Option<Value>;
+    /// Default returns None — override in modules that expose status.
+    fn status(&self) -> Option<Value> {
+        None
+    }
 
     /// Unilateral cleanup — called when a link is force-removed.
     fn force_remove(&mut self, peer: &str);
