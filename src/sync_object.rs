@@ -35,13 +35,18 @@ pub struct SyncObject<T> {
     queue_id: u64,
     /// Shared reference to the registry.
     registry: Option<RegistryRef>,
-    /// Shared ref count on the ConnectionState — decremented on Drop.
+    /// Shared ref count on the ConnectionState — decremented on Drop only if connected.
     ref_count: Option<Arc<AtomicUsize>>,
+    /// Whether this SyncObject has been bilaterally confirmed.
+    /// Only connected SyncObjects count toward ref_count.
+    connected: bool,
 }
 
 impl<T> SyncObject<T> {
     /// Create a new SyncObject bound to a peer, registering a queue in the registry.
     /// The `ref_count` comes from the ConnectionState for this module+peer.
+    /// Create a new SyncObject bound to a peer, registering a queue in the registry.
+    /// Starts as disconnected — ref_count is NOT incremented until set_connected().
     pub fn new(
         data: T,
         peer: &str,
@@ -50,13 +55,13 @@ impl<T> SyncObject<T> {
         ref_count: Arc<AtomicUsize>,
     ) -> Self {
         let queue_id = registry.lock().unwrap().register(peer, module);
-        ref_count.fetch_add(1, Ordering::Relaxed);
         SyncObject {
             data,
             peer: peer.to_string(),
             queue_id,
             registry: Some(registry.clone()),
             ref_count: Some(ref_count),
+            connected: false,
         }
     }
 
@@ -68,6 +73,7 @@ impl<T> SyncObject<T> {
             queue_id: 0,
             registry: None,
             ref_count: None,
+            connected: false,
         }
     }
 
@@ -97,6 +103,21 @@ impl<T> SyncObject<T> {
         self.queue_id
     }
 
+    /// Mark this SyncObject as bilaterally connected.
+    /// Increments ref_count. Panics if already connected.
+    pub fn set_connected(&mut self) {
+        assert!(!self.connected, "SyncObject already connected");
+        self.connected = true;
+        if let Some(ref rc) = self.ref_count {
+            rc.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether this SyncObject has been bilaterally confirmed.
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
     /// True if the outbox has pending entries for this sync object.
     pub fn has_pending(&self) -> bool {
         if let Some(ref reg) = self.registry {
@@ -109,12 +130,14 @@ impl<T> SyncObject<T> {
 
     /// Reconnect to a registry after deserialization.
     /// The queue data should already exist in the registry from persisted state.
-    /// The `ref_count` comes from the ConnectionState for this module+peer.
+    /// Preserves the connected state — if it was connected before persist,
+    /// it should be set_connected() again after reattach.
     pub fn reattach(&mut self, registry: &RegistryRef, module: &str, ref_count: Arc<AtomicUsize>) {
         registry.lock().unwrap().reattach(self.queue_id, &self.peer, module);
-        ref_count.fetch_add(1, Ordering::Relaxed);
         self.registry = Some(registry.clone());
         self.ref_count = Some(ref_count);
+        // Note: does NOT increment ref_count or set connected.
+        // Caller should call set_connected() if this SO was previously connected.
     }
 }
 
@@ -136,8 +159,11 @@ impl<T> Drop for SyncObject<T> {
         if let Some(ref reg) = self.registry {
             reg.lock().unwrap().unregister(self.queue_id);
         }
-        if let Some(ref rc) = self.ref_count {
-            rc.fetch_sub(1, Ordering::Relaxed);
+        // Only decrement ref_count if this SO was connected.
+        if self.connected {
+            if let Some(ref rc) = self.ref_count {
+                rc.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -170,8 +196,9 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
             data: inner.data,
             peer: inner.peer,
             queue_id: inner.queue_id,
-            registry: None,   // restored by reattach()
+            registry: None,    // restored by reattach()
             ref_count: None,   // restored by reattach()
+            connected: false,  // restored by set_connected() after reattach
         })
     }
 }
@@ -225,23 +252,55 @@ mod tests {
     }
 
     #[test]
-    fn drop_decrements_ref_count() {
+    fn new_does_not_increment_ref_count() {
         let reg = registry::new_registry();
         let rc = make_ref_count();
-        {
-            let _obj = SyncObject::new((), "alice", &reg, "triad", rc.clone());
-            assert_eq!(rc.load(Ordering::Relaxed), 1);
-        }
-        // After drop, ref count is back to 0.
+        let _obj = SyncObject::new((), "alice", &reg, "triad", rc.clone());
+        // Disconnected — ref count untouched.
         assert_eq!(rc.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn multiple_sync_objects_track_refs() {
+    fn set_connected_increments_ref_count() {
         let reg = registry::new_registry();
         let rc = make_ref_count();
-        let obj1 = SyncObject::new((), "alice", &reg, "triad", rc.clone());
-        let obj2 = SyncObject::new((), "bob", &reg, "triad", rc.clone());
+        let mut obj = SyncObject::new((), "alice", &reg, "triad", rc.clone());
+        assert_eq!(rc.load(Ordering::Relaxed), 0);
+        assert!(!obj.is_connected());
+
+        obj.set_connected();
+        assert_eq!(rc.load(Ordering::Relaxed), 1);
+        assert!(obj.is_connected());
+    }
+
+    #[test]
+    fn drop_decrements_only_if_connected() {
+        let reg = registry::new_registry();
+        let rc = make_ref_count();
+        {
+            // Disconnected — drop does not decrement.
+            let _obj = SyncObject::new((), "alice", &reg, "triad", rc.clone());
+            assert_eq!(rc.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(rc.load(Ordering::Relaxed), 0);
+
+        {
+            // Connected — drop decrements.
+            let mut obj = SyncObject::new((), "bob", &reg, "triad", rc.clone());
+            obj.set_connected();
+            assert_eq!(rc.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(rc.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn multiple_connected_sync_objects_track_refs() {
+        let reg = registry::new_registry();
+        let rc = make_ref_count();
+        let mut obj1 = SyncObject::new((), "alice", &reg, "triad", rc.clone());
+        let mut obj2 = SyncObject::new((), "bob", &reg, "triad", rc.clone());
+        obj1.set_connected();
+        obj2.set_connected();
         assert_eq!(rc.load(Ordering::Relaxed), 2);
 
         drop(obj1);
@@ -256,8 +315,10 @@ mod tests {
         let reg = registry::new_registry();
         let rc_triad = make_ref_count();
         let rc_loops = make_ref_count();
-        let _obj1 = SyncObject::new((), "alice", &reg, "triad", rc_triad.clone());
-        let _obj2 = SyncObject::new((), "alice", &reg, "loops", rc_loops.clone());
+        let mut obj1 = SyncObject::new((), "alice", &reg, "triad", rc_triad.clone());
+        let mut obj2 = SyncObject::new((), "alice", &reg, "loops", rc_loops.clone());
+        obj1.set_connected();
+        obj2.set_connected();
         assert_eq!(rc_triad.load(Ordering::Relaxed), 1);
         assert_eq!(rc_loops.load(Ordering::Relaxed), 1);
     }
