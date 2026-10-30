@@ -48,6 +48,24 @@ impl SoConfig {
     }
 }
 
+/// True if `msg` is older than `best` (for oldest-first selection).
+fn is_older(msg: &QueuedMsg, best: &Option<QueuedMsg>) -> bool {
+    match best {
+        None => true,
+        Some(b) => {
+            if msg.queued_at == 0 && b.queued_at == 0 {
+                false
+            } else if msg.queued_at == 0 {
+                false
+            } else if b.queued_at == 0 {
+                true
+            } else {
+                msg.queued_at < b.queued_at
+            }
+        }
+    }
+}
+
 /// Split "trustline.payment" → ("trustline", "payment").
 /// If no dot, returns ("", method).
 fn split_method(method: &str) -> (&str, &str) {
@@ -1048,6 +1066,29 @@ impl Node {
         }
 
         // Collect from registry outboxes — oldest entry wins.
+        let reg = self.registry.lock().unwrap();
+        let mut best: Option<QueuedMsg> = None;
+
+        // SO-instance queues (new system).
+        for (&so_id, inst) in &lk.so_table.instances {
+            if inst.status != ConnectionStatus::Connected {
+                continue;
+            }
+            for candidate in reg.collect_outbox_by_so(so_id, peer) {
+                let msg = QueuedMsg {
+                    so_id,
+                    method: candidate.method,
+                    payload: candidate.payload,
+                    queued_at: candidate.queued_at,
+                    queue_id: candidate.queue_id,
+                };
+                if is_older(&msg, &best) {
+                    best = Some(msg);
+                }
+            }
+        }
+
+        // Legacy module queues (namespace-routed).
         let connected_modules: Vec<String> = self
             .modules
             .keys()
@@ -1055,32 +1096,16 @@ impl Node {
             .cloned()
             .collect();
 
-        let reg = self.registry.lock().unwrap();
-        let mut best: Option<QueuedMsg> = None;
         for mod_name in &connected_modules {
             for candidate in reg.collect_outbox(mod_name, peer) {
                 let msg = QueuedMsg {
-                    so_id: 0, // legacy: no so_id for namespace-routed messages
+                    so_id: 0,
                     method: format!("{}.{}", mod_name, candidate.method),
                     payload: candidate.payload,
                     queued_at: candidate.queued_at,
                     queue_id: candidate.queue_id,
                 };
-                let is_better = match &best {
-                    None => true,
-                    Some(b) => {
-                        if msg.queued_at == 0 && b.queued_at == 0 {
-                            false
-                        } else if msg.queued_at == 0 {
-                            false
-                        } else if b.queued_at == 0 {
-                            true
-                        } else {
-                            msg.queued_at < b.queued_at
-                        }
-                    }
-                };
-                if is_better {
+                if is_older(&msg, &best) {
                     best = Some(msg);
                 }
             }

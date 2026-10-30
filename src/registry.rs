@@ -22,8 +22,11 @@ pub type RegistryRef = Arc<Mutex<SyncRegistry>>;
 pub struct SyncQueue {
     /// Which peer this queue sends to.
     pub peer: String,
-    /// Which module owns this queue.
+    /// Which module owns this queue (legacy).
     pub module: String,
+    /// Bilateral SO instance ID (new routing). 0 = legacy/unset.
+    #[serde(default)]
+    pub so_id: u64,
     /// How this SO connects (Auto or Invite).
     #[serde(default)]
     pub connect_mode: ConnectMode,
@@ -63,6 +66,24 @@ impl SyncRegistry {
             SyncQueue {
                 peer: peer.to_string(),
                 module: module.to_string(),
+                so_id: 0,
+                connect_mode: mode,
+                entries: Vec::new(),
+            },
+        );
+        id
+    }
+
+    /// Register a new queue for an SO instance. Returns the queue ID.
+    pub fn register_so(&mut self, peer: &str, so_id: u64, so_type: &str, mode: ConnectMode) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.queues.insert(
+            id,
+            SyncQueue {
+                peer: peer.to_string(),
+                module: so_type.to_string(),
+                so_id,
                 connect_mode: mode,
                 entries: Vec::new(),
             },
@@ -78,6 +99,7 @@ impl SyncRegistry {
         self.queues.entry(id).or_insert_with(|| SyncQueue {
             peer: peer.to_string(),
             module: module.to_string(),
+            so_id: 0,
             connect_mode: mode,
             entries: Vec::new(),
         });
@@ -156,6 +178,25 @@ impl SyncRegistry {
         let mut candidates = Vec::new();
         for (&id, sq) in &self.queues {
             if sq.module != module || sq.peer != peer {
+                continue;
+            }
+            if let Some(head) = sq.entries.first() {
+                candidates.push(OutboxCandidate {
+                    queue_id: id,
+                    method: head.method.clone(),
+                    payload: head.payload.clone(),
+                    queued_at: head.time,
+                });
+            }
+        }
+        candidates
+    }
+
+    /// Collect the oldest outbox entry per queue for a peer's SO instance.
+    pub fn collect_outbox_by_so(&self, so_id: u64, peer: &str) -> Vec<OutboxCandidate> {
+        let mut candidates = Vec::new();
+        for (&id, sq) in &self.queues {
+            if sq.so_id != so_id || sq.peer != peer {
                 continue;
             }
             if let Some(head) = sq.entries.first() {
