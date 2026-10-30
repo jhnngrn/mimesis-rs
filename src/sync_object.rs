@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-use crate::link::ChildTracker;
+use crate::link::{ChildTracker, ConnectMode};
 use crate::registry::RegistryRef;
 
 /// SyncObject<T> wraps module data with a registry-managed queue.
@@ -34,24 +34,23 @@ pub struct SyncObject<T> {
     registry: Option<RegistryRef>,
     /// Parent's child tracker — this SO registers/unregisters itself here.
     parent: Option<ChildTracker>,
-    /// Whether this SyncObject has been bilaterally confirmed.
-    /// Only connected SyncObjects count in the parent's connected set.
-    connected: bool,
+    /// How this SO connects (Auto or Invite).
+    connect_mode: ConnectMode,
 }
 
 impl<T> SyncObject<T> {
     /// Create a new SyncObject bound to a peer, registering a queue in the registry.
     /// The `parent` ChildTracker comes from the ConnectionState for this module+peer.
-    /// Create a new SyncObject bound to a peer, registering a queue in the registry.
-    /// Starts as disconnected — the parent's connected set is NOT updated until set_connected().
+    /// Starts as disconnected — the transport sets connected on bilateral confirmation.
     pub fn new(
         data: T,
         peer: &str,
         registry: &RegistryRef,
         module: &str,
         parent: ChildTracker,
+        mode: ConnectMode,
     ) -> Self {
-        let queue_id = registry.lock().unwrap().register(peer, module);
+        let queue_id = registry.lock().unwrap().register(peer, module, mode);
         parent.register(queue_id);
         SyncObject {
             data,
@@ -59,7 +58,7 @@ impl<T> SyncObject<T> {
             queue_id,
             registry: Some(registry.clone()),
             parent: Some(parent),
-            connected: false,
+            connect_mode: mode,
         }
     }
 
@@ -71,7 +70,7 @@ impl<T> SyncObject<T> {
             queue_id: 0,
             registry: None,
             parent: None,
-            connected: false,
+            connect_mode: ConnectMode::Auto,
         }
     }
 
@@ -102,18 +101,23 @@ impl<T> SyncObject<T> {
     }
 
     /// Mark this SyncObject as bilaterally connected.
-    /// Adds this SO to the parent's connected set. Panics if already connected.
-    pub fn set_connected(&mut self) {
-        assert!(!self.connected, "SyncObject already connected");
-        self.connected = true;
+    /// For Auto mode, the transport calls this via the tracker directly.
+    /// For Invite mode, module code calls this after explicit accept.
+    pub fn set_connected(&self) {
         if let Some(ref p) = self.parent {
             p.set_connected(self.queue_id);
         }
     }
 
     /// Whether this SyncObject has been bilaterally confirmed.
+    /// Queries the parent tracker — no local bool.
     pub fn is_connected(&self) -> bool {
-        self.connected
+        self.parent.as_ref().map_or(false, |p| p.is_connected(self.queue_id))
+    }
+
+    /// The connect mode for this SyncObject.
+    pub fn connect_mode(&self) -> ConnectMode {
+        self.connect_mode
     }
 
     /// True if the outbox has pending entries for this sync object.
@@ -131,7 +135,7 @@ impl<T> SyncObject<T> {
     /// Registers this SO in the parent's child tracker (as disconnected).
     /// Caller should call set_connected() if this SO was previously connected.
     pub fn reattach(&mut self, registry: &RegistryRef, module: &str, parent: ChildTracker) {
-        registry.lock().unwrap().reattach(self.queue_id, &self.peer, module);
+        registry.lock().unwrap().reattach(self.queue_id, &self.peer, module, self.connect_mode);
         parent.register(self.queue_id);
         self.registry = Some(registry.clone());
         self.parent = Some(parent);
@@ -193,7 +197,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for SyncObject<T> {
             queue_id: inner.queue_id,
             registry: None,   // restored by reattach()
             parent: None,     // restored by reattach()
-            connected: false, // restored by set_connected() after reattach
+            connect_mode: ConnectMode::Auto, // restored by reattach if different
         })
     }
 }
@@ -221,7 +225,7 @@ mod tests {
     fn send_enqueues_in_registry() {
         let reg = registry::new_registry();
         let tracker = make_tracker();
-        let obj = SyncObject::new((), "alice", &reg, "triad", tracker);
+        let obj = SyncObject::new((), "alice", &reg, "triad", tracker, ConnectMode::Auto);
 
         obj.send("payment", None);
 
@@ -235,8 +239,8 @@ mod tests {
         let reg = registry::new_registry();
         let t_a = make_tracker();
         let t_b = make_tracker();
-        let obj_a = SyncObject::new((), "alice", &reg, "triad", t_a);
-        let obj_b = SyncObject::new((), "bob", &reg, "triad", t_b);
+        let obj_a = SyncObject::new((), "alice", &reg, "triad", t_a, ConnectMode::Auto);
+        let obj_b = SyncObject::new((), "bob", &reg, "triad", t_b, ConnectMode::Auto);
 
         obj_a.send("x", None);
         obj_b.send("y", None);
@@ -250,7 +254,7 @@ mod tests {
     fn new_registers_but_not_connected() {
         let reg = registry::new_registry();
         let tracker = make_tracker();
-        let _obj = SyncObject::new((), "alice", &reg, "triad", tracker.clone());
+        let _obj = SyncObject::new((), "alice", &reg, "triad", tracker.clone(), ConnectMode::Auto);
         // Registered but not connected.
         assert_eq!(tracker.total_count(), 1);
         assert_eq!(tracker.connected_count(), 0);
@@ -260,7 +264,7 @@ mod tests {
     fn set_connected_adds_to_connected_set() {
         let reg = registry::new_registry();
         let tracker = make_tracker();
-        let mut obj = SyncObject::new((), "alice", &reg, "triad", tracker.clone());
+        let obj = SyncObject::new((), "alice", &reg, "triad", tracker.clone(), ConnectMode::Auto);
         assert!(!obj.is_connected());
         assert!(!tracker.has_connected());
 
@@ -276,7 +280,7 @@ mod tests {
         let tracker = make_tracker();
         {
             // Disconnected — drop removes from all set.
-            let _obj = SyncObject::new((), "alice", &reg, "triad", tracker.clone());
+            let _obj = SyncObject::new((), "alice", &reg, "triad", tracker.clone(), ConnectMode::Auto);
             assert_eq!(tracker.total_count(), 1);
         }
         assert_eq!(tracker.total_count(), 0);
@@ -284,7 +288,7 @@ mod tests {
 
         {
             // Connected — drop removes from both sets.
-            let mut obj = SyncObject::new((), "bob", &reg, "triad", tracker.clone());
+            let obj = SyncObject::new((), "bob", &reg, "triad", tracker.clone(), ConnectMode::Auto);
             obj.set_connected();
             assert_eq!(tracker.connected_count(), 1);
         }
@@ -296,8 +300,8 @@ mod tests {
     fn multiple_connected_sync_objects() {
         let reg = registry::new_registry();
         let tracker = make_tracker();
-        let mut obj1 = SyncObject::new((), "alice", &reg, "triad", tracker.clone());
-        let mut obj2 = SyncObject::new((), "bob", &reg, "triad", tracker.clone());
+        let obj1 = SyncObject::new((), "alice", &reg, "triad", tracker.clone(), ConnectMode::Auto);
+        let obj2 = SyncObject::new((), "bob", &reg, "triad", tracker.clone(), ConnectMode::Auto);
         obj1.set_connected();
         obj2.set_connected();
         assert_eq!(tracker.connected_count(), 2);
@@ -314,8 +318,8 @@ mod tests {
         let reg = registry::new_registry();
         let t_triad = make_tracker();
         let t_loops = make_tracker();
-        let mut obj1 = SyncObject::new((), "alice", &reg, "triad", t_triad.clone());
-        let mut obj2 = SyncObject::new((), "alice", &reg, "loops", t_loops.clone());
+        let obj1 = SyncObject::new((), "alice", &reg, "triad", t_triad.clone(), ConnectMode::Auto);
+        let obj2 = SyncObject::new((), "alice", &reg, "loops", t_loops.clone(), ConnectMode::Auto);
         obj1.set_connected();
         obj2.set_connected();
         assert_eq!(t_triad.connected_count(), 1);

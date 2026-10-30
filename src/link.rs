@@ -23,6 +23,26 @@ pub enum ConnectionStatus {
 }
 
 // ---------------------------------------------------------------------------
+// ConnectMode — how a SyncObject connects
+// ---------------------------------------------------------------------------
+
+/// How a SyncObject establishes its bilateral connection.
+/// - Auto: connected automatically when the first bilateral transaction succeeds.
+/// - Invite: requires an explicit accept/reject handshake before connecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectMode {
+    Auto,
+    Invite,
+}
+
+impl Default for ConnectMode {
+    fn default() -> Self {
+        ConnectMode::Auto
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ChildTracker — tracks child SyncObjects and their connected state
 // ---------------------------------------------------------------------------
 
@@ -65,6 +85,11 @@ impl ChildTracker {
         let mut inner = self.inner.lock().unwrap();
         debug_assert!(inner.all.contains(&queue_id), "set_connected on unregistered child");
         inner.connected.insert(queue_id);
+    }
+
+    /// True if the given child is in the connected set.
+    pub fn is_connected(&self, queue_id: u64) -> bool {
+        self.inner.lock().unwrap().connected.contains(&queue_id)
     }
 
     /// Number of connected children.

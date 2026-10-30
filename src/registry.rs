@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::link::OutboxEntry;
+use crate::link::{ConnectMode, OutboxEntry};
 
 /// Shared reference to the registry. Held by Node and by each SyncObject.
 pub type RegistryRef = Arc<Mutex<SyncRegistry>>;
@@ -24,6 +24,9 @@ pub struct SyncQueue {
     pub peer: String,
     /// Which module owns this queue.
     pub module: String,
+    /// How this SO connects (Auto or Invite).
+    #[serde(default)]
+    pub connect_mode: ConnectMode,
     /// Pending outbox messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<OutboxEntry>,
@@ -52,7 +55,7 @@ impl SyncRegistry {
 
     /// Register a new queue for a module bound to a peer. Returns the queue ID.
     /// Ref counting is managed by ConnectionState, not the registry.
-    pub fn register(&mut self, peer: &str, module: &str) -> u64 {
+    pub fn register(&mut self, peer: &str, module: &str, mode: ConnectMode) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.queues.insert(
@@ -60,6 +63,7 @@ impl SyncRegistry {
             SyncQueue {
                 peer: peer.to_string(),
                 module: module.to_string(),
+                connect_mode: mode,
                 entries: Vec::new(),
             },
         );
@@ -69,11 +73,12 @@ impl SyncRegistry {
     /// Re-register a queue with a known ID (for deserialization).
     /// The queue data should already be in the registry from persisted state.
     /// Ref counting is managed by ConnectionState via the SyncObject's reattach.
-    pub fn reattach(&mut self, id: u64, peer: &str, module: &str) {
+    pub fn reattach(&mut self, id: u64, peer: &str, module: &str, mode: ConnectMode) {
         // Ensure the queue exists (it should from deserialized state).
         self.queues.entry(id).or_insert_with(|| SyncQueue {
             peer: peer.to_string(),
             module: module.to_string(),
+            connect_mode: mode,
             entries: Vec::new(),
         });
         // Keep next_id above any reattached ID.
@@ -86,6 +91,11 @@ impl SyncRegistry {
     /// Ref count decrement happens in SyncObject::Drop via the Arc<AtomicUsize>.
     pub fn unregister(&mut self, id: u64) {
         self.queues.remove(&id);
+    }
+
+    /// Look up a queue by ID (for transport-level decisions).
+    pub fn get_queue(&self, id: u64) -> Option<&SyncQueue> {
+        self.queues.get(&id)
     }
 
     /// Enqueue a message and mark the peer for kicking.
@@ -188,7 +198,7 @@ mod tests {
     #[test]
     fn register_and_enqueue() {
         let mut reg = SyncRegistry::new();
-        let id = reg.register("alice", "triad");
+        let id = reg.register("alice", "triad", ConnectMode::Auto);
         reg.enqueue(id, "payment", None);
 
         assert!(reg.has_pending("triad", "alice"));
@@ -198,7 +208,7 @@ mod tests {
     #[test]
     fn dequeue_removes_head() {
         let mut reg = SyncRegistry::new();
-        let id = reg.register("alice", "triad");
+        let id = reg.register("alice", "triad", ConnectMode::Auto);
         reg.enqueue(id, "a", None);
         reg.enqueue(id, "b", None);
 
@@ -217,8 +227,8 @@ mod tests {
     #[test]
     fn kicks_tracked_on_enqueue() {
         let mut reg = SyncRegistry::new();
-        let id_a = reg.register("alice", "triad");
-        let id_b = reg.register("bob", "triad");
+        let id_a = reg.register("alice", "triad", ConnectMode::Auto);
+        let id_b = reg.register("bob", "triad", ConnectMode::Auto);
         reg.enqueue(id_a, "x", None);
         reg.enqueue(id_b, "y", None);
 
@@ -233,8 +243,8 @@ mod tests {
     #[test]
     fn multiple_queues_same_peer() {
         let mut reg = SyncRegistry::new();
-        let id1 = reg.register("alice", "triad");
-        let id2 = reg.register("alice", "triad");
+        let id1 = reg.register("alice", "triad", ConnectMode::Auto);
+        let id2 = reg.register("alice", "triad", ConnectMode::Auto);
 
         reg.enqueue(id1, "pay1", None);
         reg.enqueue(id2, "pay2", None);
@@ -246,7 +256,7 @@ mod tests {
     #[test]
     fn reattach_bumps_next_id() {
         let mut reg = SyncRegistry::new();
-        reg.reattach(42, "alice", "triad");
+        reg.reattach(42, "alice", "triad", ConnectMode::Auto);
         assert!(reg.next_id > 42);
     }
 }
