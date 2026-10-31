@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::link::{
     ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
@@ -99,7 +100,7 @@ pub struct Node {
     so_types: HashMap<String, SoConfig>,
     /// Registered modules by name.
     #[serde(skip)]
-    modules: HashMap<String, Box<dyn Module>>,
+    modules: HashMap<String, Arc<Mutex<dyn Module>>>,
     /// Next SO instance ID to assign.
     #[serde(default)]
     next_so_id: u64,
@@ -134,7 +135,7 @@ impl Node {
     }
 
     /// Register a module instance.
-    pub fn register_module(&mut self, name: &str, module: Box<dyn Module>) {
+    pub fn register_module(&mut self, name: &str, module: Arc<Mutex<dyn Module>>) {
         self.modules.insert(name.to_string(), module);
     }
 
@@ -222,12 +223,12 @@ impl Node {
         self.links.get_mut(peer)
     }
 
-    pub fn module_map(&self) -> &HashMap<String, Box<dyn Module>> {
+    pub fn module_map(&self) -> &HashMap<String, Arc<Mutex<dyn Module>>> {
         &self.modules
     }
 
-    pub fn module_mut(&mut self, name: &str) -> Option<&mut Box<dyn Module>> {
-        self.modules.get_mut(name)
+    pub fn module_mut(&mut self, name: &str) -> Option<&Arc<Mutex<dyn Module>>> {
+        self.modules.get(name)
     }
 
     /// Create a new outgoing link to peer running the named root SO type.
@@ -292,13 +293,13 @@ impl Node {
             let root = lk.state.root.clone();
             let mod_names: Vec<String> = lk.state.modules.keys().cloned().collect();
             for name in &mod_names {
-                if let Some(m) = self.modules.get_mut(name) {
-                    m.force_remove(peer);
+                if let Some(m) = self.modules.get(name) {
+                    m.lock().unwrap().force_remove(peer);
                 }
             }
             if let Some(ref r) = root {
-                if let Some(m) = self.modules.get_mut(r.as_str()) {
-                    m.force_remove(peer);
+                if let Some(m) = self.modules.get(r.as_str()) {
+                    m.lock().unwrap().force_remove(peer);
                 }
             }
             // Clean up SO instances for this peer.
@@ -456,8 +457,8 @@ impl Node {
             let so_type = lk.so_table.get(so_id)
                 .map(|inst| inst.so_type.clone())
                 .ok_or(SyncError::BadMethod)?;
-            let m = self.modules.get_mut(&so_type).ok_or(SyncError::BadMethod)?;
-            match m.handle_request(peer, full_method, payload, ts) {
+            let m = self.modules.get(&so_type).ok_or(SyncError::BadMethod)?;
+            match m.lock().unwrap().handle_request(peer, full_method, payload, ts) {
                 Ok(r) => return Ok(r.ok),
                 Err(e) => return Err(SyncError::Other(e.to_string())),
             }
@@ -477,8 +478,8 @@ impl Node {
         if !lk.module_connected(ns) {
             return Err(SyncError::BadMethod);
         }
-        let m = self.modules.get_mut(ns).ok_or(SyncError::BadMethod)?;
-        match m.handle_request(peer, method, payload, ts) {
+        let m = self.modules.get(ns).ok_or(SyncError::BadMethod)?;
+        match m.lock().unwrap().handle_request(peer, method, payload, ts) {
             Ok(r) => Ok(r.ok),
             Err(e) => Err(SyncError::Other(e.to_string())),
         }
@@ -519,9 +520,9 @@ impl Node {
                 if status == Some(ConnectionStatus::Waiting) || is_auto {
                     let root = lk.state.root.clone().unwrap_or_default();
                     // 1. Call module handler first (custom init).
-                    if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        let method = m.connects_on().to_string();
-                        match m.handle_request(peer, &method, payload, ts) {
+                    if let Some(m) = self.modules.get(root.as_str()) {
+                        let method = m.lock().unwrap().connects_on().to_string();
+                        match m.lock().unwrap().handle_request(peer, &method, payload, ts) {
                             Ok(r) if !r.ok => return Ok(false),
                             Err(_) => return Ok(false),
                             _ => {}
@@ -556,16 +557,16 @@ impl Node {
                     let root = lk.state.root.clone().unwrap_or_default();
                     // Call module handlers for close (cleanup).
                     for name in &mod_names {
-                        if let Some(m) = self.modules.get_mut(name.as_str()) {
-                            let close_method = m.closes_on().first()
+                        if let Some(m) = self.modules.get(name.as_str()) {
+                            let close_method = m.lock().unwrap().closes_on().first()
                                 .unwrap_or(&"close").to_string();
-                            let _ = m.handle_request(peer, &close_method, None, ts);
+                            let _ = m.lock().unwrap().handle_request(peer, &close_method, None, ts);
                         }
                     }
-                    if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        let close_method = m.closes_on().first()
+                    if let Some(m) = self.modules.get(root.as_str()) {
+                        let close_method = m.lock().unwrap().closes_on().first()
                             .unwrap_or(&"close").to_string();
-                        let _ = m.handle_request(peer, &close_method, None, ts);
+                        let _ = m.lock().unwrap().handle_request(peer, &close_method, None, ts);
                     }
                 }
                 self.links.remove(peer);
@@ -614,9 +615,9 @@ impl Node {
                     || mod_state.status == Some(ConnectionStatus::Waiting)
                 {
                     // 1. Call module handler first.
-                    if let Some(m) = self.modules.get_mut(name.as_str()) {
-                        let method = m.connects_on().to_string();
-                        match m.handle_request(peer, &method, payload, ts) {
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        let method = m.lock().unwrap().connects_on().to_string();
+                        match m.lock().unwrap().handle_request(peer, &method, payload, ts) {
                             Ok(r) if !r.ok => return Ok(false),
                             Err(_) => return Ok(false),
                             _ => {}
@@ -631,9 +632,9 @@ impl Node {
                 }
                 if mode == ConnectMode::Auto {
                     // 1. Call module handler first.
-                    if let Some(m) = self.modules.get_mut(name.as_str()) {
-                        let method = m.connects_on().to_string();
-                        match m.handle_request(peer, &method, payload, ts) {
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        let method = m.lock().unwrap().connects_on().to_string();
+                        match m.lock().unwrap().handle_request(peer, &method, payload, ts) {
                             Ok(r) if !r.ok => return Ok(false),
                             Err(_) => return Ok(false),
                             _ => {}
@@ -673,10 +674,10 @@ impl Node {
                 }
                 lk.state.modules.remove(&name);
                 if was_connected {
-                    if let Some(m) = self.modules.get_mut(name.as_str()) {
-                        let close_method = m.closes_on().first()
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        let close_method = m.lock().unwrap().closes_on().first()
                             .unwrap_or(&"close").to_string();
-                        let _ = m.handle_request(peer, &close_method, payload, ts);
+                        let _ = m.lock().unwrap().handle_request(peer, &close_method, payload, ts);
                     }
                 }
                 Ok(true)
@@ -707,8 +708,8 @@ impl Node {
                 .and_then(|lk| lk.so_table.get(so_id))
                 .map(|inst| inst.so_type.clone());
             if let Some(so_type) = so_type {
-                if let Some(m) = self.modules.get_mut(&so_type) {
-                    m.handle_response(peer, full_method, payload, ok, ts);
+                if let Some(m) = self.modules.get(&so_type) {
+                    m.lock().unwrap().handle_response(peer, full_method, payload, ok, ts);
                 }
             }
             return;
@@ -724,8 +725,8 @@ impl Node {
             self.dispatch_module_response(peer, method, payload, ok, ts);
             return;
         }
-        if let Some(m) = self.modules.get_mut(ns) {
-            m.handle_response(peer, method, payload, ok, ts);
+        if let Some(m) = self.modules.get(ns) {
+            m.lock().unwrap().handle_response(peer, method, payload, ok, ts);
         }
     }
 
@@ -746,9 +747,9 @@ impl Node {
                 if ok {
                     let root = lk.state.root.clone().unwrap_or_default();
                     // 1. Call module handler first (notification).
-                    if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        let method = m.connects_on().to_string();
-                        m.handle_response(peer, &method, payload, true, ts);
+                    if let Some(m) = self.modules.get(root.as_str()) {
+                        let method = m.lock().unwrap().connects_on().to_string();
+                        m.lock().unwrap().handle_response(peer, &method, payload, true, ts);
                     }
                     // 2. Common state logic.
                     let lk = self.links.get_mut(peer).unwrap();
@@ -778,16 +779,16 @@ impl Node {
                         let root = lk.state.root.clone().unwrap_or_default();
                         // Notify modules of close.
                         for name in &mod_names {
-                            if let Some(m) = self.modules.get_mut(name.as_str()) {
-                                let close_method = m.closes_on().first()
+                            if let Some(m) = self.modules.get(name.as_str()) {
+                                let close_method = m.lock().unwrap().closes_on().first()
                                     .unwrap_or(&"close").to_string();
-                                m.handle_response(peer, &close_method, close_payload.clone(), true, ts);
+                                m.lock().unwrap().handle_response(peer, &close_method, close_payload.clone(), true, ts);
                             }
                         }
-                        if let Some(m) = self.modules.get_mut(root.as_str()) {
-                            let close_method = m.closes_on().first()
+                        if let Some(m) = self.modules.get(root.as_str()) {
+                            let close_method = m.lock().unwrap().closes_on().first()
                                 .unwrap_or(&"close").to_string();
-                            m.handle_response(peer, &close_method, close_payload, true, ts);
+                            m.lock().unwrap().handle_response(peer, &close_method, close_payload, true, ts);
                         }
                     }
                     self.links.remove(peer);
@@ -830,9 +831,9 @@ impl Node {
                 };
                 if ok {
                     // 1. Call module handler first (notification).
-                    if let Some(m) = self.modules.get_mut(name.as_str()) {
-                        let method = m.connects_on().to_string();
-                        m.handle_response(peer, &method, payload, true, ts);
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        let method = m.lock().unwrap().connects_on().to_string();
+                        m.lock().unwrap().handle_response(peer, &method, payload, true, ts);
                     }
                     // 2. Common state logic.
                     let lk = self.links.get_mut(peer).unwrap();
@@ -858,10 +859,10 @@ impl Node {
                         mod_state.status == Some(ConnectionStatus::Connected);
                     lk.state.modules.remove(&name);
                     if was_connected {
-                        if let Some(m) = self.modules.get_mut(name.as_str()) {
-                            let close_method = m.closes_on().first()
+                        if let Some(m) = self.modules.get(name.as_str()) {
+                            let close_method = m.lock().unwrap().closes_on().first()
                                 .unwrap_or(&"close").to_string();
-                            m.handle_response(peer, &close_method, payload, true, ts);
+                            m.lock().unwrap().handle_response(peer, &close_method, payload, true, ts);
                         }
                     }
                 } else {
@@ -1303,7 +1304,7 @@ mod tests {
     fn connect_creates_link_with_intent() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
-        node.register_module("trustline", Box::new(TestModule::new()));
+        node.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         node.connect("bob@b.com", "trustline").unwrap();
         let lk = node.get("bob@b.com").unwrap();
@@ -1322,7 +1323,7 @@ mod tests {
     fn next_tx_returns_connect() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
-        node.register_module("trustline", Box::new(TestModule::new()));
+        node.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         node.connect("bob@b.com", "trustline").unwrap();
 
         let msg = node.next_tx("bob@b.com").unwrap();
@@ -1333,7 +1334,7 @@ mod tests {
     fn next_tx_cancels_opposing_intents() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
-        node.register_module("trustline", Box::new(TestModule::new()));
+        node.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         node.connect("bob@b.com", "trustline").unwrap();
 
         let lk = node.get_mut("bob@b.com").unwrap();
@@ -1360,7 +1361,7 @@ mod tests {
     fn bilateral_connect_via_dispatch() {
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_root("trustline", vec![]);
-        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let msg = alice.next_tx("bob@b.com").unwrap();
@@ -1369,7 +1370,7 @@ mod tests {
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp.ok);
@@ -1404,7 +1405,7 @@ mod tests {
     fn bilateral_close_via_dispatch() {
         let mut node = Node::new("alice@a.com".into());
         node.declare_root("trustline", vec![]);
-        node.register_module("trustline", Box::new(TestModule::new()));
+        node.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         node.connect("bob@b.com", "trustline").unwrap();
         let lk = node.get_mut("bob@b.com").unwrap();
         lk.state.conn.status = Some(ConnectionStatus::Connected);
@@ -1422,7 +1423,7 @@ mod tests {
     fn so_instance_created_on_connect() {
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_so("trustline", SoConfig::auto());
-        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let msg = alice.next_tx("bob@b.com").unwrap();
@@ -1430,7 +1431,7 @@ mod tests {
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp.ok);
@@ -1449,12 +1450,12 @@ mod tests {
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         // Connect alice → bob.
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_root("trustline", vec![]);
-        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
         let msg = alice.next_tx("bob@b.com").unwrap();
         let env = alice.build_request("bob@b.com", &msg).unwrap();
@@ -1503,12 +1504,12 @@ mod tests {
 
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_so("trustline", SoConfig::auto());
-        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
@@ -1601,12 +1602,12 @@ mod tests {
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_so("trustline", SoConfig::auto());
         alice.declare_so("novation", SoConfig::auto()); // Auto mode
-        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
@@ -1661,12 +1662,12 @@ mod tests {
         let mut alice = Node::new("alice@a.com".into());
         alice.declare_so("trustline", SoConfig::auto());
         alice.declare_so("payment", SoConfig::invite()); // Invite mode
-        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
+        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();

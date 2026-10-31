@@ -61,7 +61,7 @@ impl Default for Config {
 // ---------------------------------------------------------------------------
 
 /// Factory function that creates a module instance.
-pub type ModuleFactory = Box<dyn Fn(&str, &str, &Node) -> Box<dyn Module> + Send + Sync>;
+pub type ModuleFactory = Box<dyn Fn(&str, &str, &Node) -> Arc<Mutex<dyn Module>> + Send + Sync>;
 
 struct ModuleReg {
     name: String,
@@ -564,7 +564,7 @@ impl Server {
                     if let Some(dot) = method.find('.') {
                         let (mod_name, mod_method) = (&method[..dot], &method[dot + 1..]);
                         if let Some(m) = n.module_mut(mod_name) {
-                            match m.handle_account(mod_method, payload) {
+                            match m.lock().unwrap().handle_account(mod_method, payload) {
                                 Ok(Some(result)) => api_ok(&result),
                                 Ok(None) => api_ok(&serde_json::json!(true)),
                                 Err(e) => api_error(&e.to_string()),
