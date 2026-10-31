@@ -18,13 +18,16 @@ use crate::registry::{self, RegistryRef};
 /// Maximum number of concurrent links per node.
 pub const MAX_LINKS: usize = 64;
 
-/// Configuration for a declared SyncObject type.
+/// Configuration for a declared module/SO type.
 #[derive(Debug, Clone)]
 pub struct SoConfig {
-    /// How this SO type connects (Auto or Invite).
+    /// How this module connects (Auto or Invite).
     pub connect_mode: ConnectMode,
-    /// Child SO types that can exist under this one.
+    /// Child module types that can exist under this one.
     pub children: Vec<String>,
+    /// Whether the framework creates an SoInstance (queue + ref count) on connect.
+    /// Modules with has_so=false get dispatch only — no queue, no SoInstance.
+    pub has_so: bool,
 }
 
 impl SoConfig {
@@ -32,6 +35,7 @@ impl SoConfig {
         SoConfig {
             connect_mode: ConnectMode::Auto,
             children: vec![],
+            has_so: true,
         }
     }
 
@@ -39,6 +43,16 @@ impl SoConfig {
         SoConfig {
             connect_mode: ConnectMode::Invite,
             children: vec![],
+            has_so: true,
+        }
+    }
+
+    /// Dispatch-only: module gets routed messages but no SoInstance/queue.
+    pub fn dispatch_only() -> Self {
+        SoConfig {
+            connect_mode: ConnectMode::Auto,
+            children: vec![],
+            has_so: false,
         }
     }
 
@@ -111,10 +125,12 @@ impl Node {
         self.so_types.insert(name.to_string(), config);
     }
 
-    /// Backwards-compatible: declare a root with children (all Auto mode).
+    /// Declare a root module with children but no SO (dispatch only).
+    /// The module gets on_connect/on_close and message routing,
+    /// but no SoInstance or queue is created by the framework.
     pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
         self.so_types
-            .insert(name.to_string(), SoConfig::auto().with_children(children));
+            .insert(name.to_string(), SoConfig::dispatch_only().with_children(children));
     }
 
     /// Register a module instance.
@@ -455,10 +471,10 @@ impl Node {
         let (ns, method) = split_method(full_method);
 
         if ns == "link" {
-            return self.dispatch_link_request(peer, method, payload);
+            return self.dispatch_link_request(peer, method, payload, ts);
         }
         if ns == "module" {
-            return self.dispatch_module_request(peer, method, payload);
+            return self.dispatch_module_request(peer, method, payload, ts);
         }
         // Application module message (legacy).
         let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
@@ -477,6 +493,7 @@ impl Node {
         peer: &str,
         method: &str,
         payload: Option<Value>,
+        ts: i64,
     ) -> Result<bool, SyncError> {
         match method {
             "connect" => {
@@ -504,15 +521,22 @@ impl Node {
                 let status = lk.state.conn.status.clone();
                 let is_auto = self.connect_mode_for(name) == ConnectMode::Auto;
                 if status == Some(ConnectionStatus::Waiting) || is_auto {
+                    let root = lk.state.root.clone().unwrap_or_default();
+                    // 1. Call module handler first (custom init).
+                    if let Some(m) = self.modules.get_mut(root.as_str()) {
+                        let method = m.connects_on().to_string();
+                        match m.handle_request(peer, &method, payload, ts) {
+                            Ok(r) if !r.ok => return Ok(false),
+                            Err(_) => return Ok(false),
+                            _ => {}
+                        }
+                    }
+                    // 2. Common state logic.
                     let lk = self.links.get_mut(peer).unwrap();
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
-                    let root = lk.state.root.clone().unwrap_or_default();
-                    // Create root SO instance (data only).
-                    self.create_root_so(peer, &root);
-                    // Call module on_connect.
-                    if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        m.on_connect(peer, payload);
+                    if self.so_types.get(&root).map_or(false, |c| c.has_so) {
+                        self.create_root_so(peer, &root);
                     }
                     return Ok(true);
                 }
@@ -534,14 +558,18 @@ impl Node {
                         .map(|(n, _)| n.clone())
                         .collect();
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // Close modules.
+                    // Call module handlers for close (cleanup).
                     for name in &mod_names {
                         if let Some(m) = self.modules.get_mut(name.as_str()) {
-                            m.on_close(peer, None);
+                            let close_method = m.closes_on().first()
+                                .unwrap_or(&"close").to_string();
+                            let _ = m.handle_request(peer, &close_method, None, ts);
                         }
                     }
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        m.on_close(peer, None);
+                        let close_method = m.closes_on().first()
+                            .unwrap_or(&"close").to_string();
+                        let _ = m.handle_request(peer, &close_method, None, ts);
                     }
                 }
                 self.links.remove(peer);
@@ -559,46 +587,66 @@ impl Node {
         peer: &str,
         method: &str,
         payload: Option<Value>,
+        ts: i64,
     ) -> Result<bool, SyncError> {
-        let name = payload
+        let name: String = payload
             .as_ref()
             .and_then(|p| p.get("name"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
         let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
         let root = lk.state.root.clone().unwrap_or_default();
 
         match method {
             "connect" => {
-                if name.is_empty() || !self.is_child_module(name, &root) {
+                if name.is_empty() || !self.is_child_module(&name, &root) {
                     return Ok(false);
                 }
-                if !self.modules.contains_key(name) {
+                if !self.modules.contains_key(&name) {
                     return Ok(false);
                 }
-                let mode = self.connect_mode_for(name);
+                let mode = self.connect_mode_for(&name);
                 let lk = self.links.get_mut(peer).unwrap();
                 let mod_state =
-                    lk.state.modules.entry(name.to_string()).or_default();
+                    lk.state.modules.entry(name.clone()).or_default();
                 if mod_state.status == Some(ConnectionStatus::Connected) {
                     return Ok(true);
                 }
                 if mod_state.intent_connect
                     || mod_state.status == Some(ConnectionStatus::Waiting)
                 {
+                    // 1. Call module handler first.
+                    if let Some(m) = self.modules.get_mut(name.as_str()) {
+                        let method = m.connects_on().to_string();
+                        match m.handle_request(peer, &method, payload, ts) {
+                            Ok(r) if !r.ok => return Ok(false),
+                            Err(_) => return Ok(false),
+                            _ => {}
+                        }
+                    }
+                    // 2. Common state logic.
+                    let lk = self.links.get_mut(peer).unwrap();
+                    let mod_state = lk.state.modules.get_mut(&name).unwrap();
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
-                    if let Some(m) = self.modules.get_mut(name) {
-                        m.on_connect(peer, payload);
-                    }
                     return Ok(true);
                 }
                 if mode == ConnectMode::Auto {
-                    mod_state.status = Some(ConnectionStatus::Connected);
-                    if let Some(m) = self.modules.get_mut(name) {
-                        m.on_connect(peer, payload);
+                    // 1. Call module handler first.
+                    if let Some(m) = self.modules.get_mut(name.as_str()) {
+                        let method = m.connects_on().to_string();
+                        match m.handle_request(peer, &method, payload, ts) {
+                            Ok(r) if !r.ok => return Ok(false),
+                            Err(_) => return Ok(false),
+                            _ => {}
+                        }
                     }
+                    // 2. Common state logic.
+                    let lk = self.links.get_mut(peer).unwrap();
+                    let mod_state = lk.state.modules.get_mut(&name).unwrap();
+                    mod_state.status = Some(ConnectionStatus::Connected);
                     return Ok(true);
                 }
                 if mode == ConnectMode::Closed {
@@ -608,10 +656,10 @@ impl Node {
                 Ok(false)
             }
             "close" => {
-                if name.is_empty() || !self.is_child_module(name, &root) {
+                if name.is_empty() || !self.is_child_module(&name, &root) {
                     return Ok(false);
                 }
-                if let Some(cs) = self.connection_state(peer, name) {
+                if let Some(cs) = self.connection_state(peer, &name) {
                     if cs.children.has_connected() {
                         return Err(SyncError::RefsHeld);
                     }
@@ -620,17 +668,19 @@ impl Node {
                 let was_connected = lk
                     .state
                     .modules
-                    .get(name)
+                    .get(&name)
                     .map_or(false, |s| {
                         s.status == Some(ConnectionStatus::Connected)
                     });
-                if !lk.state.modules.contains_key(name) {
+                if !lk.state.modules.contains_key(&name) {
                     return Ok(true);
                 }
-                lk.state.modules.remove(name);
+                lk.state.modules.remove(&name);
                 if was_connected {
-                    if let Some(m) = self.modules.get_mut(name) {
-                        m.on_close(peer, payload);
+                    if let Some(m) = self.modules.get_mut(name.as_str()) {
+                        let close_method = m.closes_on().first()
+                            .unwrap_or(&"close").to_string();
+                        let _ = m.handle_request(peer, &close_method, payload, ts);
                     }
                 }
                 Ok(true)
@@ -671,11 +721,11 @@ impl Node {
         // Legacy namespace-based routing.
         let (ns, method) = split_method(full_method);
         if ns == "link" {
-            self.dispatch_link_response(peer, method, payload, ok);
+            self.dispatch_link_response(peer, method, payload, ok, ts);
             return;
         }
         if ns == "module" {
-            self.dispatch_module_response(peer, method, payload, ok);
+            self.dispatch_module_response(peer, method, payload, ok, ts);
             return;
         }
         if let Some(m) = self.modules.get_mut(ns) {
@@ -689,6 +739,7 @@ impl Node {
         method: &str,
         payload: Option<Value>,
         ok: bool,
+        ts: i64,
     ) {
         match method {
             "connect" => {
@@ -697,14 +748,18 @@ impl Node {
                     None => return,
                 };
                 if ok {
+                    let root = lk.state.root.clone().unwrap_or_default();
+                    // 1. Call module handler first (notification).
+                    if let Some(m) = self.modules.get_mut(root.as_str()) {
+                        let method = m.connects_on().to_string();
+                        m.handle_response(peer, &method, payload, true, ts);
+                    }
+                    // 2. Common state logic.
+                    let lk = self.links.get_mut(peer).unwrap();
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
-                    let root = lk.state.root.clone().unwrap_or_default();
-                    // Create root SO instance (data only).
-                    self.create_root_so(peer, &root);
-                    // Call module on_connect.
-                    if let Some(m) = self.modules.get_mut(root.as_str()) {
-                        m.on_connect(peer, payload);
+                    if self.so_types.get(&root).map_or(false, |c| c.has_so) {
+                        self.create_root_so(peer, &root);
                     }
                 } else {
                     lk.state.conn.status = Some(ConnectionStatus::Waiting);
@@ -725,14 +780,18 @@ impl Node {
                             .map(|(n, _)| n.clone())
                             .collect();
                         let root = lk.state.root.clone().unwrap_or_default();
-                        // Close modules.
+                        // Notify modules of close.
                         for name in &mod_names {
                             if let Some(m) = self.modules.get_mut(name.as_str()) {
-                                m.on_close(peer, close_payload.clone());
+                                let close_method = m.closes_on().first()
+                                    .unwrap_or(&"close").to_string();
+                                m.handle_response(peer, &close_method, close_payload.clone(), true, ts);
                             }
                         }
                         if let Some(m) = self.modules.get_mut(root.as_str()) {
-                            m.on_close(peer, close_payload);
+                            let close_method = m.closes_on().first()
+                                .unwrap_or(&"close").to_string();
+                            m.handle_response(peer, &close_method, close_payload, true, ts);
                         }
                     }
                     self.links.remove(peer);
@@ -752,12 +811,14 @@ impl Node {
         method: &str,
         payload: Option<Value>,
         ok: bool,
+        ts: i64,
     ) {
-        let name = payload
+        let name: String = payload
             .as_ref()
             .and_then(|p| p.get("name"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         if name.is_empty() {
             return;
         }
@@ -767,16 +828,21 @@ impl Node {
                     Some(lk) => lk,
                     None => return,
                 };
-                let mod_state = match lk.state.modules.get_mut(name) {
+                let mod_state = match lk.state.modules.get_mut(&name) {
                     Some(s) => s,
                     None => return,
                 };
                 if ok {
+                    // 1. Call module handler first (notification).
+                    if let Some(m) = self.modules.get_mut(name.as_str()) {
+                        let method = m.connects_on().to_string();
+                        m.handle_response(peer, &method, payload, true, ts);
+                    }
+                    // 2. Common state logic.
+                    let lk = self.links.get_mut(peer).unwrap();
+                    let mod_state = lk.state.modules.get_mut(&name).unwrap();
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
-                    if let Some(m) = self.modules.get_mut(name) {
-                        m.on_connect(peer, payload);
-                    }
                 } else {
                     mod_state.status = Some(ConnectionStatus::Waiting);
                     mod_state.intent_connect = false;
@@ -787,21 +853,23 @@ impl Node {
                     Some(lk) => lk,
                     None => return,
                 };
-                let mod_state = match lk.state.modules.get(name) {
+                let mod_state = match lk.state.modules.get(&name) {
                     Some(s) => s,
                     None => return,
                 };
                 if ok {
                     let was_connected =
                         mod_state.status == Some(ConnectionStatus::Connected);
-                    lk.state.modules.remove(name);
+                    lk.state.modules.remove(&name);
                     if was_connected {
-                        if let Some(m) = self.modules.get_mut(name) {
-                            m.on_close(peer, payload);
+                        if let Some(m) = self.modules.get_mut(name.as_str()) {
+                            let close_method = m.closes_on().first()
+                                .unwrap_or(&"close").to_string();
+                            m.handle_response(peer, &close_method, payload, true, ts);
                         }
                     }
                 } else {
-                    if let Some(s) = lk.state.modules.get_mut(name) {
+                    if let Some(s) = lk.state.modules.get_mut(&name) {
                         s.intent_close = false;
                     }
                 }
@@ -1211,32 +1279,40 @@ mod tests {
     }
 
     impl Module for TestModule {
-        fn on_connect(&mut self, peer: &str, _payload: Option<Value>) {
-            self.connected_peers.push(peer.to_string());
-        }
-        fn on_close(&mut self, peer: &str, _payload: Option<Value>) {
-            self.closed_peers.push(peer.to_string());
-        }
         fn handle_request(
             &mut self,
-            _peer: &str,
-            _method: &str,
+            peer: &str,
+            method: &str,
             _payload: Option<Value>,
             _ts: i64,
         ) -> Result<HandleResult, Box<dyn std::error::Error>> {
+            if method == self.connects_on() {
+                self.connected_peers.push(peer.to_string());
+            }
+            if self.closes_on().contains(&method) {
+                self.closed_peers.push(peer.to_string());
+            }
             Ok(HandleResult { ok: true })
         }
         fn handle_response(
             &mut self,
-            _peer: &str,
-            _method: &str,
+            peer: &str,
+            method: &str,
             _payload: Option<Value>,
-            _ok: bool,
+            ok: bool,
             _ts: i64,
         ) {
+            if method == self.connects_on() && ok {
+                self.connected_peers.push(peer.to_string());
+            }
+            if self.closes_on().contains(&method) && ok {
+                self.closed_peers.push(peer.to_string());
+            }
         }
         fn force_remove(&mut self, peer: &str) {
-            self.on_close(peer, None);
+            let close_method = self.closes_on().first()
+                .unwrap_or(&"close").to_string();
+            let _ = self.handle_request(peer, &close_method, None, 0);
         }
         fn reattach_sync_objects(&mut self, _registry: &crate::registry::RegistryRef) {}
     }
