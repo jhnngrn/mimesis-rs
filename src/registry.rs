@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::link::{ConnectMode, OutboxEntry};
+use crate::link::OutboxEntry;
 
 /// Shared reference to the registry. Held by Node and by each SyncObject.
 pub type RegistryRef = Arc<Mutex<SyncRegistry>>;
@@ -27,9 +27,6 @@ pub struct SyncQueue {
     /// Bilateral SO instance ID (new routing). 0 = legacy/unset.
     #[serde(default)]
     pub so_id: u64,
-    /// How this SO connects (Auto or Invite).
-    #[serde(default)]
-    pub connect_mode: ConnectMode,
     /// Pending outbox messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<OutboxEntry>,
@@ -57,8 +54,7 @@ impl SyncRegistry {
     }
 
     /// Register a new queue for a module bound to a peer. Returns the queue ID.
-    /// Ref counting is managed by ConnectionState, not the registry.
-    pub fn register(&mut self, peer: &str, module: &str, mode: ConnectMode) -> u64 {
+    pub fn register(&mut self, peer: &str, module: &str) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.queues.insert(
@@ -67,7 +63,6 @@ impl SyncRegistry {
                 peer: peer.to_string(),
                 module: module.to_string(),
                 so_id: 0,
-                connect_mode: mode,
                 entries: Vec::new(),
             },
         );
@@ -75,7 +70,7 @@ impl SyncRegistry {
     }
 
     /// Register a new queue for an SO instance. Returns the queue ID.
-    pub fn register_so(&mut self, peer: &str, so_id: u64, so_type: &str, mode: ConnectMode) -> u64 {
+    pub fn register_so(&mut self, peer: &str, so_id: u64, so_type: &str) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.queues.insert(
@@ -84,7 +79,6 @@ impl SyncRegistry {
                 peer: peer.to_string(),
                 module: so_type.to_string(),
                 so_id,
-                connect_mode: mode,
                 entries: Vec::new(),
             },
         );
@@ -93,17 +87,13 @@ impl SyncRegistry {
 
     /// Re-register a queue with a known ID (for deserialization).
     /// The queue data should already be in the registry from persisted state.
-    /// Ref counting is managed by ConnectionState via the SyncObject's reattach.
-    pub fn reattach(&mut self, id: u64, peer: &str, module: &str, mode: ConnectMode) {
-        // Ensure the queue exists (it should from deserialized state).
+    pub fn reattach(&mut self, id: u64, peer: &str, module: &str) {
         self.queues.entry(id).or_insert_with(|| SyncQueue {
             peer: peer.to_string(),
             module: module.to_string(),
             so_id: 0,
-            connect_mode: mode,
             entries: Vec::new(),
         });
-        // Keep next_id above any reattached ID.
         if id >= self.next_id {
             self.next_id = id + 1;
         }
@@ -249,7 +239,7 @@ mod tests {
     #[test]
     fn register_and_enqueue() {
         let mut reg = SyncRegistry::new();
-        let id = reg.register("alice", "triad", ConnectMode::Auto);
+        let id = reg.register("alice", "triad");
         reg.enqueue(id, "payment", None);
 
         assert!(reg.has_pending("triad", "alice"));
@@ -259,7 +249,7 @@ mod tests {
     #[test]
     fn dequeue_removes_head() {
         let mut reg = SyncRegistry::new();
-        let id = reg.register("alice", "triad", ConnectMode::Auto);
+        let id = reg.register("alice", "triad");
         reg.enqueue(id, "a", None);
         reg.enqueue(id, "b", None);
 
@@ -278,8 +268,8 @@ mod tests {
     #[test]
     fn kicks_tracked_on_enqueue() {
         let mut reg = SyncRegistry::new();
-        let id_a = reg.register("alice", "triad", ConnectMode::Auto);
-        let id_b = reg.register("bob", "triad", ConnectMode::Auto);
+        let id_a = reg.register("alice", "triad");
+        let id_b = reg.register("bob", "triad");
         reg.enqueue(id_a, "x", None);
         reg.enqueue(id_b, "y", None);
 
@@ -287,15 +277,14 @@ mod tests {
         assert!(kicks.contains("alice"));
         assert!(kicks.contains("bob"));
 
-        // Drained — next drain is empty.
         assert!(reg.drain_kicks().is_empty());
     }
 
     #[test]
     fn multiple_queues_same_peer() {
         let mut reg = SyncRegistry::new();
-        let id1 = reg.register("alice", "triad", ConnectMode::Auto);
-        let id2 = reg.register("alice", "triad", ConnectMode::Auto);
+        let id1 = reg.register("alice", "triad");
+        let id2 = reg.register("alice", "triad");
 
         reg.enqueue(id1, "pay1", None);
         reg.enqueue(id2, "pay2", None);
@@ -307,7 +296,7 @@ mod tests {
     #[test]
     fn reattach_bumps_next_id() {
         let mut reg = SyncRegistry::new();
-        reg.reattach(42, "alice", "triad", ConnectMode::Auto);
+        reg.reattach(42, "alice", "triad");
         assert!(reg.next_id > 42);
     }
 }

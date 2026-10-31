@@ -315,12 +315,11 @@ impl Node {
     /// The SO is data only; the Module handles all logic.
     fn create_root_so(&mut self, peer: &str, so_type: &str) {
         let so_id = self.alloc_so_id();
-        let mode = self.connect_mode_for(so_type);
         // Register a queue in the registry for this SO instance.
         self.registry
             .lock()
             .unwrap()
-            .register_so(peer, so_id, so_type, mode);
+            .register_so(peer, so_id, so_type);
 
         let instance = SoInstance {
             so_type: so_type.to_string(),
@@ -328,9 +327,6 @@ impl Node {
             status: ConnectionStatus::Connected,
             children: Default::default(),
             so_children: Vec::new(),
-            intent_connect: false,
-            intent_close: false,
-            connect_payload: None,
         };
         if let Some(lk) = self.links.get_mut(peer) {
             lk.so_table.insert(so_id, instance);
@@ -1052,7 +1048,6 @@ impl Node {
             for (_, inst) in &lk.so_table.instances {
                 if inst.status == ConnectionStatus::Connected
                     && !inst.children.has_connected()
-                    && !inst.intent_close
                 {
                     // TODO: emit SO close message
                 }
@@ -1149,19 +1144,6 @@ impl Node {
                 queued_at: 0,
                 queue_id: 0,
             });
-        }
-
-        // SO child connect intents (legacy — SoInstance with intent_connect).
-        for (&so_id, inst) in &lk.so_table.instances {
-            if inst.intent_connect {
-                return Some(QueuedMsg {
-                    so_id,
-                    method: "connect".into(),
-                    payload: inst.connect_payload.clone(),
-                    queued_at: 0,
-                    queue_id: 0,
-                });
-            }
         }
 
         // Pending child SO creates — children with so_id: None, status: None.

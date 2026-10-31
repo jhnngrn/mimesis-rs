@@ -164,21 +164,12 @@ pub struct SoInstance {
     pub parent_id: Option<u64>,
     /// Connection status.
     pub status: ConnectionStatus,
-    /// Tracks child SO instances (legacy ref counting).
+    /// Tracks child SO instances for lifecycle ref counting.
     #[serde(skip)]
     pub children: ChildTracker,
     /// Child SOs at all lifecycle stages (pending through connected).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub so_children: Vec<SoChild>,
-    /// Whether this SO wants to connect (pending outgoing connect).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub intent_connect: bool,
-    /// Whether this SO wants to close.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub intent_close: bool,
-    /// Payload for the connect message (used with intent_connect).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connect_payload: Option<serde_json::Value>,
 }
 
 /// Table of SO instances on a link, keyed by bilateral ID.
@@ -446,15 +437,13 @@ impl Link {
             .map_or(false, |inst| inst.status == ConnectionStatus::Connected)
     }
 
-    /// True if an SO instance is connected and not closing.
+    /// True if an SO instance is connected and the link is not closing.
     pub fn so_available(&self, so_id: u64) -> bool {
         if self.state.conn.intent_close {
             return false;
         }
         self.so_table.get(so_id)
-            .map_or(false, |inst| {
-                inst.status == ConnectionStatus::Connected && !inst.intent_close
-            })
+            .map_or(false, |inst| inst.status == ConnectionStatus::Connected)
     }
 
     /// Finalize a received response to our outgoing message.
