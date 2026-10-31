@@ -463,6 +463,30 @@ impl Node {
         }
     }
 
+    /// Handle NACK on a pending child create message.
+    /// - Auto: remove the child (shouldn't have been NACKed)
+    /// - Invite/Closed: keep in Waiting (mutual-add / accept flow)
+    fn handle_nacked_children(&mut self, peer: &str) {
+        let so_types = &self.so_types;
+        if let Some(lk) = self.links.get_mut(peer) {
+            for inst in lk.so_table.instances.values_mut() {
+                inst.so_children.retain(|child| {
+                    if child.so_id.is_none()
+                        && child.status == Some(ConnectionStatus::Waiting)
+                    {
+                        let mode = so_types
+                            .get(&child.so_type)
+                            .map_or(ConnectMode::Auto, |cfg| cfg.connect_mode);
+                        // Auto → remove; Invite/Closed → keep in Waiting
+                        mode != ConnectMode::Auto
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Ref checks
     // -----------------------------------------------------------------------
@@ -1023,6 +1047,8 @@ impl Node {
                 };
                 if resp.ok {
                     self.finalize_pending_children(&peer, piggybacked_counter);
+                } else {
+                    self.handle_nacked_children(&peer);
                 }
             }
         }
@@ -1932,5 +1958,133 @@ mod tests {
         let child = &root.so_children[0];
         assert_eq!(child.so_id, Some(tx_counter), "child so_id should equal the transaction counter");
         assert_eq!(child.status, Some(ConnectionStatus::Connected));
+    }
+
+    #[test]
+    fn nack_removes_auto_child() {
+        use crate::link::SoChild;
+
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        alice.declare_so("novation", SoConfig::auto()); // Auto mode
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Bilateral connect.
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let resp = bob.handle_incoming(&env).unwrap();
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.pending = Some(msg.clone());
+        }
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.ok, resp.timestamp);
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.accept_response(resp.timestamp);
+        }
+
+        let root_so_id = {
+            let lk = alice.get("bob@b.com").unwrap();
+            let (id, _) = lk.so_table.root().unwrap();
+            id
+        };
+
+        // Add pending child.
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            let root = lk.so_table.get_mut(root_so_id).unwrap();
+            root.so_children.push(SoChild {
+                so_id: None,
+                so_type: "novation".into(),
+                status: None,
+                method: "commit".into(),
+                payload: None,
+            });
+        }
+
+        // next_tx picks it up → status becomes Waiting.
+        let creating_msg = alice.next_tx("bob@b.com").unwrap();
+        assert_eq!(creating_msg.method, "commit");
+
+        // Simulate NACK.
+        alice.handle_nacked_children("bob@b.com");
+
+        // Auto mode → child should be removed.
+        let lk = alice.get("bob@b.com").unwrap();
+        let root = lk.so_table.get(root_so_id).unwrap();
+        assert!(root.so_children.is_empty(), "Auto child should be removed on NACK");
+    }
+
+    #[test]
+    fn nack_keeps_invite_child() {
+        use crate::link::SoChild;
+
+        let mut alice = Node::new("alice@a.com".into());
+        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        alice.declare_so("payment", SoConfig::invite()); // Invite mode
+        alice.register_module("trustline", Box::new(TestModule::new()));
+        alice.connect("bob@b.com", "trustline").unwrap();
+
+        let mut bob = Node::new("bob@b.com".into());
+        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
+            Box::new(TestSoHandler::new())
+        });
+        bob.register_module("trustline", Box::new(TestModule::new()));
+
+        // Bilateral connect.
+        let msg = alice.next_tx("bob@b.com").unwrap();
+        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let resp = bob.handle_incoming(&env).unwrap();
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.pending = Some(msg.clone());
+        }
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.ok, resp.timestamp);
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            lk.accept_response(resp.timestamp);
+        }
+
+        let root_so_id = {
+            let lk = alice.get("bob@b.com").unwrap();
+            let (id, _) = lk.so_table.root().unwrap();
+            id
+        };
+
+        // Add pending child with Invite-mode type.
+        {
+            let lk = alice.get_mut("bob@b.com").unwrap();
+            let root = lk.so_table.get_mut(root_so_id).unwrap();
+            root.so_children.push(SoChild {
+                so_id: None,
+                so_type: "payment".into(),
+                status: None,
+                method: "request".into(),
+                payload: None,
+            });
+        }
+
+        // next_tx picks it up → status becomes Waiting.
+        alice.next_tx("bob@b.com").unwrap();
+
+        // Simulate NACK.
+        alice.handle_nacked_children("bob@b.com");
+
+        // Invite mode → child should stay in Waiting.
+        let lk = alice.get("bob@b.com").unwrap();
+        let root = lk.so_table.get(root_so_id).unwrap();
+        assert_eq!(root.so_children.len(), 1, "Invite child should stay on NACK");
+        assert_eq!(root.so_children[0].status, Some(ConnectionStatus::Waiting));
     }
 }
