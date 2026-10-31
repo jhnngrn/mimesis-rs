@@ -1,18 +1,18 @@
 //! Node — collection of bilateral links for an identity.
 //!
-//! Manages the set of links, SO instance dispatch, and the sync protocol
-//! that drives bilateral communication. Messages are routed to SO instances
-//! by their bilateral ID (so_id), not by namespace strings.
+//! Manages the set of links and the sync protocol that drives bilateral
+//! communication. SyncObjects (SOs) are pure data (ref-counted queues);
+//! the Module trait handles all application logic.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::link::{
-    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoChild, SoInstance,
+    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
     SyncError, TxRequest, TxResponse, ValidateResult, now_secs,
 };
-use crate::module::{HandleResult, Module, SoContext, SoHandler, SoIntent};
+use crate::module::Module;
 use crate::registry::{self, RegistryRef};
 
 /// Maximum number of concurrent links per node.
@@ -75,9 +75,6 @@ fn split_method(method: &str) -> (&str, &str) {
     }
 }
 
-/// Key for looking up an SO handler: (peer, so_id).
-type HandlerKey = (String, u64);
-
 /// Node manages the set of bilateral links for an identity.
 #[derive(Serialize, Deserialize)]
 pub struct Node {
@@ -86,15 +83,9 @@ pub struct Node {
     /// Declared SO types and their configuration.
     #[serde(skip)]
     so_types: HashMap<String, SoConfig>,
-    /// Registered modules by name (legacy — used during migration).
+    /// Registered modules by name.
     #[serde(skip)]
     modules: HashMap<String, Box<dyn Module>>,
-    /// SO handlers keyed by (peer, so_id).
-    #[serde(skip)]
-    handlers: HashMap<HandlerKey, Box<dyn SoHandler>>,
-    /// Factory functions for creating SO handlers, keyed by SO type name.
-    #[serde(skip)]
-    so_factories: HashMap<String, Box<dyn Fn() -> Box<dyn SoHandler> + Send + Sync>>,
     /// Next SO instance ID to assign.
     #[serde(default)]
     next_so_id: u64,
@@ -110,8 +101,6 @@ impl Node {
             links: HashMap::new(),
             so_types: HashMap::new(),
             modules: HashMap::new(),
-            handlers: HashMap::new(),
-            so_factories: HashMap::new(),
             next_so_id: 1, // 0 reserved for lifecycle
             registry: registry::new_registry(),
         }
@@ -122,22 +111,13 @@ impl Node {
         self.so_types.insert(name.to_string(), config);
     }
 
-    /// Declare a SO type with a handler factory.
-    pub fn declare_so_with_factory<F>(&mut self, name: &str, config: SoConfig, factory: F)
-    where
-        F: Fn() -> Box<dyn SoHandler> + Send + Sync + 'static,
-    {
-        self.so_types.insert(name.to_string(), config);
-        self.so_factories.insert(name.to_string(), Box::new(factory));
-    }
-
     /// Backwards-compatible: declare a root with children (all Auto mode).
     pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
         self.so_types
             .insert(name.to_string(), SoConfig::auto().with_children(children));
     }
 
-    /// Register a module instance (legacy — use declare_so_with_factory instead).
+    /// Register a module instance.
     pub fn register_module(&mut self, name: &str, module: Box<dyn Module>) {
         self.modules.insert(name.to_string(), module);
     }
@@ -154,23 +134,8 @@ impl Node {
         id
     }
 
-    /// Get an SO handler by (peer, so_id).
-    pub fn handler(&self, peer: &str, so_id: u64) -> Option<&Box<dyn SoHandler>> {
-        self.handlers.get(&(peer.to_string(), so_id))
-    }
-
-    /// Get a mutable SO handler by (peer, so_id).
-    pub fn handler_mut(&mut self, peer: &str, so_id: u64) -> Option<&mut Box<dyn SoHandler>> {
-        self.handlers.get_mut(&(peer.to_string(), so_id))
-    }
-
-    /// Create a new SO handler instance from a registered factory.
-    fn create_handler(&self, so_type: &str) -> Option<Box<dyn SoHandler>> {
-        self.so_factories.get(so_type).map(|f| f())
-    }
-
     // -----------------------------------------------------------------------
-    // Legacy methods — kept during migration
+    // Accessors
     // -----------------------------------------------------------------------
 
     /// Get the ConnectionState for a module on a peer's link.
@@ -320,28 +285,23 @@ impl Node {
                     m.force_remove(peer);
                 }
             }
-            // Also clean up SO handlers for this peer.
-            let so_ids: Vec<u64> = lk.so_table.instances.keys().cloned().collect();
-            for so_id in so_ids {
-                if let Some(mut h) = self.handlers.remove(&(peer.to_string(), so_id)) {
-                    h.force_remove(peer);
-                }
-            }
+            // Clean up SO instances for this peer.
+            // (SOs are data only; Module.force_remove handles app-level cleanup.)
         }
         self.links.remove(peer);
     }
 
     // -----------------------------------------------------------------------
-    // SO instance creation — framework creates handlers
+    // SO instance creation — SOs are pure data (queue + ref count)
     // -----------------------------------------------------------------------
 
     /// Create a root SO instance on a link when it connects.
-    fn create_root_so(&mut self, peer: &str, so_type: &str, payload: Option<Value>) {
+    /// The SO is data only; the Module handles all logic.
+    fn create_root_so(&mut self, peer: &str, so_type: &str) {
         let so_id = self.alloc_so_id();
         let mode = self.connect_mode_for(so_type);
         // Register a queue in the registry for this SO instance.
-        let queue_id = self
-            .registry
+        self.registry
             .lock()
             .unwrap()
             .register_so(peer, so_id, so_type, mode);
@@ -358,84 +318,6 @@ impl Node {
         };
         if let Some(lk) = self.links.get_mut(peer) {
             lk.so_table.insert(so_id, instance);
-        }
-        // Create handler from factory and call on_connect with context.
-        if let Some(mut handler) = self.create_handler(so_type) {
-            let mut ctx = SoContext::new(so_id, queue_id, peer, self.registry.clone());
-            handler.on_connect(&mut ctx, peer, payload);
-            // Process intents from on_connect.
-            let intents = ctx.drain_intents();
-            self.handlers
-                .insert((peer.to_string(), so_id), handler);
-            self.process_intents(peer, so_id, intents);
-        }
-    }
-
-    /// Process intents accumulated by a handler during a dispatch call.
-    fn process_intents(&mut self, peer: &str, parent_so_id: u64, intents: Vec<SoIntent>) {
-        for intent in intents {
-            match intent {
-                SoIntent::ConnectChild { so_type, payload } => {
-                    self.initiate_child_connect(peer, parent_so_id, &so_type, payload);
-                }
-                SoIntent::CreateChild { so_type, method, payload } => {
-                    // Add a pending child to the parent's so_children list.
-                    // so_id: None — will be derived from the link counter
-                    // after the creating transaction succeeds.
-                    if let Some(lk) = self.links.get_mut(peer) {
-                        if let Some(inst) = lk.so_table.get_mut(parent_so_id) {
-                            inst.so_children.push(SoChild {
-                                so_id: None,
-                                so_type,
-                                status: None,
-                                method,
-                                payload,
-                            });
-                        }
-                    }
-                }
-                SoIntent::Close { payload } => {
-                    // Mark the SO for closing — next_tx will emit the close message.
-                    if let Some(lk) = self.links.get_mut(peer) {
-                        if let Some(inst) = lk.so_table.get_mut(parent_so_id) {
-                            inst.intent_close = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Initiate child SO creation. Allocates so_id and sets intent_connect.
-    fn initiate_child_connect(
-        &mut self,
-        peer: &str,
-        parent_so_id: u64,
-        so_type: &str,
-        payload: Option<Value>,
-    ) {
-        let child_so_id = self.alloc_so_id();
-
-        // Build connect payload with type and parent info.
-        let mut connect_payload = payload.unwrap_or(serde_json::json!({}));
-        if let Some(obj) = connect_payload.as_object_mut() {
-            obj.insert("so_type".to_string(), serde_json::json!(so_type));
-            obj.insert("parent_id".to_string(), serde_json::json!(parent_so_id));
-        }
-
-        // Create the instance with intent_connect — next_tx will emit the message.
-        let instance = SoInstance {
-            so_type: so_type.to_string(),
-            parent_id: Some(parent_so_id),
-            status: ConnectionStatus::Waiting,
-            children: Default::default(),
-            so_children: Vec::new(),
-            intent_connect: true,
-            intent_close: false,
-            connect_payload: Some(connect_payload),
-        };
-        if let Some(lk) = self.links.get_mut(peer) {
-            lk.so_table.insert(child_so_id, instance);
         }
     }
 
@@ -553,25 +435,17 @@ impl Node {
         payload: Option<Value>,
         ts: i64,
     ) -> Result<bool, SyncError> {
-        // SO-id based routing: if so_id > 0, route to that instance.
+        // SO-id based routing: if so_id > 0, route to Module by SO type.
         if so_id > 0 {
             let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
             if !lk.so_connected(so_id) {
                 return Err(SyncError::BadMethod);
             }
-            // Find queue_id for this SO instance.
-            let queue_id = {
-                let reg = self.registry.lock().unwrap();
-                reg.find_queue_for_so(so_id, peer).unwrap_or(0)
-            };
-            let registry = self.registry.clone();
-            let key = (peer.to_string(), so_id);
-            let handler = self.handlers.get_mut(&key).ok_or(SyncError::BadMethod)?;
-            let mut ctx = SoContext::new(so_id, queue_id, peer, registry);
-            let result = handler.handle_request(&mut ctx, peer, full_method, payload, ts);
-            let intents = ctx.drain_intents();
-            self.process_intents(peer, so_id, intents);
-            match result {
+            let so_type = lk.so_table.get(so_id)
+                .map(|inst| inst.so_type.clone())
+                .ok_or(SyncError::BadMethod)?;
+            let m = self.modules.get_mut(&so_type).ok_or(SyncError::BadMethod)?;
+            match m.handle_request(peer, full_method, payload, ts) {
                 Ok(r) => return Ok(r.ok),
                 Err(e) => return Err(SyncError::Other(e.to_string())),
             }
@@ -634,9 +508,9 @@ impl Node {
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // Create root SO instance.
-                    self.create_root_so(peer, &root, payload.clone());
-                    // Legacy: also call module on_connect.
+                    // Create root SO instance (data only).
+                    self.create_root_so(peer, &root);
+                    // Call module on_connect.
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
                         m.on_connect(peer, payload);
                     }
@@ -660,16 +534,7 @@ impl Node {
                         .map(|(n, _)| n.clone())
                         .collect();
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // Close SO handlers.
-                    let so_ids: Vec<u64> = lk.so_table.instances.keys().cloned().collect();
-                    for so_id in so_ids {
-                        if let Some(mut h) =
-                            self.handlers.remove(&(peer.to_string(), so_id))
-                        {
-                            h.on_close(peer, None);
-                        }
-                    }
-                    // Legacy: close modules.
+                    // Close modules.
                     for name in &mod_names {
                         if let Some(m) = self.modules.get_mut(name.as_str()) {
                             m.on_close(peer, None);
@@ -790,19 +655,15 @@ impl Node {
         ok: bool,
         ts: i64,
     ) {
-        // SO-id based routing.
+        // SO-id based routing: route to Module by SO type.
         if so_id > 0 {
-            let queue_id = {
-                let reg = self.registry.lock().unwrap();
-                reg.find_queue_for_so(so_id, peer).unwrap_or(0)
-            };
-            let registry = self.registry.clone();
-            let key = (peer.to_string(), so_id);
-            if let Some(handler) = self.handlers.get_mut(&key) {
-                let mut ctx = SoContext::new(so_id, queue_id, peer, registry);
-                handler.handle_response(&mut ctx, peer, full_method, payload, ok, ts);
-                let intents = ctx.drain_intents();
-                self.process_intents(peer, so_id, intents);
+            let so_type = self.links.get(peer)
+                .and_then(|lk| lk.so_table.get(so_id))
+                .map(|inst| inst.so_type.clone());
+            if let Some(so_type) = so_type {
+                if let Some(m) = self.modules.get_mut(&so_type) {
+                    m.handle_response(peer, full_method, payload, ok, ts);
+                }
             }
             return;
         }
@@ -839,9 +700,9 @@ impl Node {
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // Create root SO instance.
-                    self.create_root_so(peer, &root, payload.clone());
-                    // Legacy: also call module on_connect.
+                    // Create root SO instance (data only).
+                    self.create_root_so(peer, &root);
+                    // Call module on_connect.
                     if let Some(m) = self.modules.get_mut(root.as_str()) {
                         m.on_connect(peer, payload);
                     }
@@ -864,17 +725,7 @@ impl Node {
                             .map(|(n, _)| n.clone())
                             .collect();
                         let root = lk.state.root.clone().unwrap_or_default();
-                        // Close SO handlers.
-                        let so_ids: Vec<u64> =
-                            lk.so_table.instances.keys().cloned().collect();
-                        for so_id in so_ids {
-                            if let Some(mut h) =
-                                self.handlers.remove(&(peer.to_string(), so_id))
-                            {
-                                h.on_close(peer, close_payload.clone());
-                            }
-                        }
-                        // Legacy.
+                        // Close modules.
                         for name in &mod_names {
                             if let Some(m) = self.modules.get_mut(name.as_str()) {
                                 m.on_close(peer, close_payload.clone());
@@ -1130,7 +981,7 @@ impl Node {
             && lk.state.conn.status == Some(ConnectionStatus::Connected)
         {
             // Close SO instances first.
-            for (&so_id, inst) in &lk.so_table.instances {
+            for (_, inst) in &lk.so_table.instances {
                 if inst.status == ConnectionStatus::Connected
                     && !inst.children.has_connected()
                     && !inst.intent_close
@@ -1342,7 +1193,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::{HandleResult, Module, SoHandler};
+    use crate::module::{HandleResult, Module};
 
     /// Minimal test module (legacy Module trait).
     struct TestModule {
@@ -1388,54 +1239,6 @@ mod tests {
             self.on_close(peer, None);
         }
         fn reattach_sync_objects(&mut self, _registry: &crate::registry::RegistryRef) {}
-    }
-
-    /// Test SO handler for the new system.
-    struct TestSoHandler {
-        connected: bool,
-        requests: Vec<String>,
-    }
-
-    impl TestSoHandler {
-        fn new() -> Self {
-            TestSoHandler {
-                connected: false,
-                requests: vec![],
-            }
-        }
-    }
-
-    impl SoHandler for TestSoHandler {
-        fn on_connect(&mut self, _ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {
-            self.connected = true;
-        }
-        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {
-            self.connected = false;
-        }
-        fn handle_request(
-            &mut self,
-            _ctx: &mut SoContext,
-            _peer: &str,
-            method: &str,
-            _payload: Option<Value>,
-            _ts: i64,
-        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
-            self.requests.push(method.to_string());
-            Ok(HandleResult { ok: true })
-        }
-        fn handle_response(
-            &mut self,
-            _ctx: &mut SoContext,
-            _peer: &str,
-            _method: &str,
-            _payload: Option<Value>,
-            _ok: bool,
-            _ts: i64,
-        ) {
-        }
-        fn force_remove(&mut self, peer: &str) {
-            self.on_close(peer, None);
-        }
     }
 
     #[test]
@@ -1558,11 +1361,9 @@ mod tests {
     }
 
     #[test]
-    fn so_handler_factory_creates_on_connect() {
+    fn so_instance_created_on_connect() {
         let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        alice.declare_so("trustline", SoConfig::auto());
         alice.register_module("trustline", Box::new(TestModule::new()));
         alice.connect("bob@b.com", "trustline").unwrap();
 
@@ -1570,15 +1371,13 @@ mod tests {
         let env = alice.build_request("bob@b.com", &msg).unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
 
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp.ok);
 
-        // Bob should have a root SO instance in the table.
+        // Bob should have a root SO instance in the table (data only, no handler).
         let bob_lk = bob.get("alice@a.com").unwrap();
         assert_eq!(bob_lk.so_table.instances.len(), 1);
         let (_, inst) = bob_lk.so_table.root().unwrap();
@@ -1586,231 +1385,12 @@ mod tests {
         assert_eq!(inst.status, ConnectionStatus::Connected);
     }
 
-    /// SO handler that enqueues a response message on connect.
-    struct EnqueueOnConnectHandler;
-
-    impl SoHandler for EnqueueOnConnectHandler {
-        fn on_connect(&mut self, ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {
-            ctx.enqueue("hello", Some(serde_json::json!({"greeting": true})));
-        }
-        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
-        fn handle_request(
-            &mut self,
-            _ctx: &mut SoContext,
-            _peer: &str,
-            _method: &str,
-            _payload: Option<Value>,
-            _ts: i64,
-        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
-            Ok(HandleResult { ok: true })
-        }
-        fn handle_response(
-            &mut self,
-            _ctx: &mut SoContext,
-            _peer: &str,
-            _method: &str,
-            _payload: Option<Value>,
-            _ok: bool,
-            _ts: i64,
-        ) {}
-        fn force_remove(&mut self, _peer: &str) {}
-    }
-
-    #[test]
-    fn so_enqueue_via_context_appears_in_next_tx() {
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(EnqueueOnConnectHandler)
-        });
-        bob.register_module("trustline", Box::new(TestModule::new()));
-
-        // Simulate incoming connect from alice.
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_root("trustline", vec![]);
-        alice.register_module("trustline", Box::new(TestModule::new()));
-        alice.connect("bob@b.com", "trustline").unwrap();
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
-
-        let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
-
-        // Bob's handler enqueued "hello" on connect.
-        // next_tx should return it routed via the SO's so_id.
-        let next = bob.next_tx("alice@a.com");
-        assert!(next.is_some(), "expected enqueued message from SO handler");
-        let next = next.unwrap();
-        assert_eq!(next.method, "hello");
-        assert!(next.so_id > 0, "SO message should have so_id > 0");
-    }
-
-    /// SO handler that calls create_child (new path) on request.
-    struct CreateChildHandler;
-
-    impl SoHandler for CreateChildHandler {
-        fn on_connect(&mut self, _ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {}
-        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
-        fn handle_request(
-            &mut self,
-            ctx: &mut SoContext,
-            _peer: &str,
-            method: &str,
-            payload: Option<Value>,
-            _ts: i64,
-        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
-            if method == "do_create" {
-                ctx.create_child("novation", "commit", payload);
-            }
-            Ok(HandleResult { ok: true })
-        }
-        fn handle_response(
-            &mut self,
-            _ctx: &mut SoContext,
-            _peer: &str,
-            _method: &str,
-            _payload: Option<Value>,
-            _ok: bool,
-            _ts: i64,
-        ) {}
-        fn force_remove(&mut self, _peer: &str) {}
-    }
-
-    #[test]
-    fn create_child_adds_pending_child_to_parent() {
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(CreateChildHandler)
-        });
-        bob.declare_so("novation", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
-
-        // Connect.
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_root("trustline", vec![]);
-        alice.register_module("trustline", Box::new(TestModule::new()));
-        alice.connect("bob@b.com", "trustline").unwrap();
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
-        let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
-
-        // Get root SO id.
-        let root_so_id = {
-            let lk = bob.get("alice@a.com").unwrap();
-            let (id, _) = lk.so_table.root().unwrap();
-            id
-        };
-
-        // Dispatch "do_create" — handler calls ctx.create_child().
-        bob.dispatch_request(
-            "alice@a.com", root_so_id, "do_create",
-            Some(serde_json::json!({"amount": 50})), 100,
-        ).unwrap();
-
-        // Parent should now have a pending child.
-        let lk = bob.get("alice@a.com").unwrap();
-        let root = lk.so_table.get(root_so_id).unwrap();
-        assert_eq!(root.so_children.len(), 1);
-        let child = &root.so_children[0];
-        assert!(child.so_id.is_none());
-        assert!(child.status.is_none());
-        assert_eq!(child.so_type, "novation");
-        assert_eq!(child.method, "commit");
-
-        // next_tx should emit the creating message with parent's so_id.
-        let next = bob.next_tx("alice@a.com").unwrap();
-        assert_eq!(next.so_id, root_so_id);
-        assert_eq!(next.method, "commit");
-    }
-
-    /// SO handler that calls connect_child on request (legacy path).
-    struct ChildSpawnerHandler;
-
-    impl SoHandler for ChildSpawnerHandler {
-        fn on_connect(&mut self, _ctx: &mut SoContext, _peer: &str, _payload: Option<Value>) {}
-        fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
-        fn handle_request(
-            &mut self,
-            ctx: &mut SoContext,
-            _peer: &str,
-            method: &str,
-            _payload: Option<Value>,
-            _ts: i64,
-        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
-            if method == "spawn" {
-                ctx.connect_child("novation", Some(serde_json::json!({"amount": 100})));
-            }
-            Ok(HandleResult { ok: true })
-        }
-        fn handle_response(
-            &mut self,
-            _ctx: &mut SoContext,
-            _peer: &str,
-            _method: &str,
-            _payload: Option<Value>,
-            _ok: bool,
-            _ts: i64,
-        ) {}
-        fn force_remove(&mut self, _peer: &str) {}
-    }
-
-    #[test]
-    fn connect_child_creates_pending_instance() {
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory(
-            "trustline",
-            SoConfig::auto().with_children(vec!["novation".to_string()]),
-            || Box::new(ChildSpawnerHandler),
-        );
-        bob.declare_so("novation", SoConfig::auto());
-        bob.register_module("trustline", Box::new(TestModule::new()));
-
-        // Connect.
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_root("trustline", vec![]);
-        alice.register_module("trustline", Box::new(TestModule::new()));
-        alice.connect("bob@b.com", "trustline").unwrap();
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
-        let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
-
-        // Get root SO id.
-        let root_so_id = {
-            let lk = bob.get("alice@a.com").unwrap();
-            let (id, _) = lk.so_table.root().unwrap();
-            id
-        };
-
-        // Dispatch a "spawn" request to the root SO.
-        bob.dispatch_request("alice@a.com", root_so_id, "spawn", None, 100)
-            .unwrap();
-
-        // Should now have a child SO instance in Waiting state.
-        let lk = bob.get("alice@a.com").unwrap();
-        assert_eq!(lk.so_table.instances.len(), 2, "root + child");
-        let children = lk.so_table.children_of(root_so_id);
-        assert_eq!(children.len(), 1);
-        let (_, child) = &children[0];
-        assert_eq!(child.so_type, "novation");
-        assert_eq!(child.status, ConnectionStatus::Waiting);
-
-        // next_tx should return the child's connect message.
-        let next = bob.next_tx("alice@a.com");
-        assert!(next.is_some());
-        let next = next.unwrap();
-        assert_eq!(next.method, "connect");
-        assert!(next.so_id > 0);
-    }
-
     #[test]
     fn pending_child_routes_via_parent_so_id() {
         use crate::link::SoChild;
 
         let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
 
         // Connect alice → bob.
@@ -1864,16 +1444,12 @@ mod tests {
         use crate::link::SoChild;
 
         let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        alice.declare_so("trustline", SoConfig::auto());
         alice.register_module("trustline", Box::new(TestModule::new()));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
 
         // Bilateral connect.
@@ -1965,17 +1541,13 @@ mod tests {
         use crate::link::SoChild;
 
         let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        alice.declare_so("trustline", SoConfig::auto());
         alice.declare_so("novation", SoConfig::auto()); // Auto mode
         alice.register_module("trustline", Box::new(TestModule::new()));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
 
         // Bilateral connect.
@@ -2029,17 +1601,13 @@ mod tests {
         use crate::link::SoChild;
 
         let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        alice.declare_so("trustline", SoConfig::auto());
         alice.declare_so("payment", SoConfig::invite()); // Invite mode
         alice.register_module("trustline", Box::new(TestModule::new()));
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so_with_factory("trustline", SoConfig::auto(), || {
-            Box::new(TestSoHandler::new())
-        });
+        bob.declare_so("trustline", SoConfig::auto());
         bob.register_module("trustline", Box::new(TestModule::new()));
 
         // Bilateral connect.
