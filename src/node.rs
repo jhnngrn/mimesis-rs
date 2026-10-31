@@ -1082,7 +1082,7 @@ impl Node {
             return None;
         }
 
-        if lk.state.conn.intent_close {
+        if lk.state.conn.intent_close && !self.has_active_refs(peer) {
             return Some(QueuedMsg {
                 so_id: 0,
                 method: "link.close".into(),
