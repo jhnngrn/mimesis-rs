@@ -440,6 +440,7 @@ impl Node {
 
     /// Dispatch an incoming sync request.
     /// Routes by so_id for SO instance messages, by namespace for legacy.
+    /// Returns tristate i8: 1 = ack, 0 = nack, -1 = error.
     pub fn dispatch_request(
         &mut self,
         peer: &str,
@@ -447,7 +448,7 @@ impl Node {
         full_method: &str,
         payload: Option<Value>,
         ts: i64,
-    ) -> Result<bool, SyncError> {
+    ) -> Result<i8, SyncError> {
         // SO-id based routing: if so_id > 0, route to Module by SO type.
         if so_id > 0 {
             let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
@@ -459,7 +460,7 @@ impl Node {
                 .ok_or(SyncError::BadMethod)?;
             let m = self.modules.get(&so_type).ok_or(SyncError::BadMethod)?;
             match m.lock().unwrap().handle_request(peer, full_method, payload, ts) {
-                Ok(r) => return Ok(r.ok),
+                Ok(result) => return Ok(result),
                 Err(e) => return Err(SyncError::Other(e.to_string())),
             }
         }
@@ -480,7 +481,7 @@ impl Node {
         }
         let m = self.modules.get(ns).ok_or(SyncError::BadMethod)?;
         match m.lock().unwrap().handle_request(peer, method, payload, ts) {
-            Ok(r) => Ok(r.ok),
+            Ok(result) => Ok(result),
             Err(e) => Err(SyncError::Other(e.to_string())),
         }
     }
@@ -490,8 +491,8 @@ impl Node {
         peer: &str,
         method: &str,
         payload: Option<Value>,
-        ts: i64,
-    ) -> Result<bool, SyncError> {
+        _ts: i64,
+    ) -> Result<i8, SyncError> {
         match method {
             "connect" => {
                 let name = payload
@@ -513,33 +514,28 @@ impl Node {
                     return Err(SyncError::Other("link already incoming".into()));
                 }
                 if lk.state.root.as_deref() != Some(name) {
-                    return Ok(false);
+                    return Ok(0);
                 }
                 let status = lk.state.conn.status.clone();
                 let is_auto = self.connect_mode_for(name) == ConnectMode::Auto;
                 if status == Some(ConnectionStatus::Waiting) || is_auto {
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // 1. Call module handler first (custom init).
-                    if let Some(m) = self.modules.get(root.as_str()) {
-                        let method = m.lock().unwrap().connects_on().to_string();
-                        match m.lock().unwrap().handle_request(peer, &method, payload, ts) {
-                            Ok(r) if !r.ok => return Ok(false),
-                            Err(_) => return Ok(false),
-                            _ => {}
-                        }
-                    }
-                    // 2. Common state logic.
+                    // Set state to Connected.
                     let lk = self.links.get_mut(peer).unwrap();
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
                     if self.so_types.get(&root).map_or(false, |c| c.has_so) {
                         self.create_root_so(peer, &root);
                     }
-                    return Ok(true);
+                    // Notify module.
+                    if let Some(m) = self.modules.get(root.as_str()) {
+                        m.lock().unwrap().on_connect(peer);
+                    }
+                    return Ok(1);
                 }
                 let lk = self.links.get_mut(peer).unwrap();
                 lk.state.conn.status = Some(ConnectionStatus::Incoming);
-                Ok(false)
+                Ok(0)
             }
             "close" => {
                 if self.has_active_refs(peer) {
@@ -555,22 +551,19 @@ impl Node {
                         .map(|(n, _)| n.clone())
                         .collect();
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // Call module handlers for close (cleanup).
+                    // Notify child modules of close (children first).
                     for name in &mod_names {
                         if let Some(m) = self.modules.get(name.as_str()) {
-                            let close_method = m.lock().unwrap().closes_on().first()
-                                .unwrap_or(&"close").to_string();
-                            let _ = m.lock().unwrap().handle_request(peer, &close_method, None, ts);
+                            m.lock().unwrap().on_close(peer);
                         }
                     }
+                    // Notify root module of close.
                     if let Some(m) = self.modules.get(root.as_str()) {
-                        let close_method = m.lock().unwrap().closes_on().first()
-                            .unwrap_or(&"close").to_string();
-                        let _ = m.lock().unwrap().handle_request(peer, &close_method, None, ts);
+                        m.lock().unwrap().on_close(peer);
                     }
                 }
                 self.links.remove(peer);
-                Ok(true)
+                Ok(1)
             }
             _ => Err(SyncError::Other(format!(
                 "unknown link method {:?}",
@@ -584,8 +577,8 @@ impl Node {
         peer: &str,
         method: &str,
         payload: Option<Value>,
-        ts: i64,
-    ) -> Result<bool, SyncError> {
+        _ts: i64,
+    ) -> Result<i8, SyncError> {
         let name: String = payload
             .as_ref()
             .and_then(|p| p.get("name"))
@@ -599,62 +592,52 @@ impl Node {
         match method {
             "connect" => {
                 if name.is_empty() || !self.is_child_module(&name, &root) {
-                    return Ok(false);
+                    return Ok(0);
                 }
                 if !self.modules.contains_key(&name) {
-                    return Ok(false);
+                    return Ok(0);
                 }
                 let mode = self.connect_mode_for(&name);
                 let lk = self.links.get_mut(peer).unwrap();
                 let mod_state =
                     lk.state.modules.entry(name.clone()).or_default();
                 if mod_state.status == Some(ConnectionStatus::Connected) {
-                    return Ok(true);
+                    return Ok(1);
                 }
                 if mod_state.intent_connect
                     || mod_state.status == Some(ConnectionStatus::Waiting)
                 {
-                    // 1. Call module handler first.
-                    if let Some(m) = self.modules.get(name.as_str()) {
-                        let method = m.lock().unwrap().connects_on().to_string();
-                        match m.lock().unwrap().handle_request(peer, &method, payload, ts) {
-                            Ok(r) if !r.ok => return Ok(false),
-                            Err(_) => return Ok(false),
-                            _ => {}
-                        }
-                    }
-                    // 2. Common state logic.
+                    // Set state to Connected.
                     let lk = self.links.get_mut(peer).unwrap();
                     let mod_state = lk.state.modules.get_mut(&name).unwrap();
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
-                    return Ok(true);
+                    // Notify module.
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        m.lock().unwrap().on_connect(peer);
+                    }
+                    return Ok(1);
                 }
                 if mode == ConnectMode::Auto {
-                    // 1. Call module handler first.
-                    if let Some(m) = self.modules.get(name.as_str()) {
-                        let method = m.lock().unwrap().connects_on().to_string();
-                        match m.lock().unwrap().handle_request(peer, &method, payload, ts) {
-                            Ok(r) if !r.ok => return Ok(false),
-                            Err(_) => return Ok(false),
-                            _ => {}
-                        }
-                    }
-                    // 2. Common state logic.
+                    // Set state to Connected.
                     let lk = self.links.get_mut(peer).unwrap();
                     let mod_state = lk.state.modules.get_mut(&name).unwrap();
                     mod_state.status = Some(ConnectionStatus::Connected);
-                    return Ok(true);
+                    // Notify module.
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        m.lock().unwrap().on_connect(peer);
+                    }
+                    return Ok(1);
                 }
                 if mode == ConnectMode::Closed {
-                    return Ok(false);
+                    return Ok(0);
                 }
                 mod_state.status = Some(ConnectionStatus::Incoming);
-                Ok(false)
+                Ok(0)
             }
             "close" => {
                 if name.is_empty() || !self.is_child_module(&name, &root) {
-                    return Ok(false);
+                    return Ok(0);
                 }
                 if let Some(cs) = self.connection_state(peer, &name) {
                     if cs.children.has_connected() {
@@ -670,17 +653,16 @@ impl Node {
                         s.status == Some(ConnectionStatus::Connected)
                     });
                 if !lk.state.modules.contains_key(&name) {
-                    return Ok(true);
+                    return Ok(1);
                 }
                 lk.state.modules.remove(&name);
                 if was_connected {
+                    // Notify module of close.
                     if let Some(m) = self.modules.get(name.as_str()) {
-                        let close_method = m.lock().unwrap().closes_on().first()
-                            .unwrap_or(&"close").to_string();
-                        let _ = m.lock().unwrap().handle_request(peer, &close_method, payload, ts);
+                        m.lock().unwrap().on_close(peer);
                     }
                 }
-                Ok(true)
+                Ok(1)
             }
             _ => Err(SyncError::Other(format!(
                 "unknown module method {:?}",
@@ -699,7 +681,7 @@ impl Node {
         so_id: u64,
         full_method: &str,
         payload: Option<Value>,
-        ok: bool,
+        result: i8,
         ts: i64,
     ) {
         // SO-id based routing: route to Module by SO type.
@@ -709,7 +691,7 @@ impl Node {
                 .map(|inst| inst.so_type.clone());
             if let Some(so_type) = so_type {
                 if let Some(m) = self.modules.get(&so_type) {
-                    m.lock().unwrap().handle_response(peer, full_method, payload, ok, ts);
+                    m.lock().unwrap().handle_response(peer, full_method, payload, result, ts);
                 }
             }
             return;
@@ -718,15 +700,15 @@ impl Node {
         // Legacy namespace-based routing.
         let (ns, method) = split_method(full_method);
         if ns == "link" {
-            self.dispatch_link_response(peer, method, payload, ok, ts);
+            self.dispatch_link_response(peer, method, payload, result, ts);
             return;
         }
         if ns == "module" {
-            self.dispatch_module_response(peer, method, payload, ok, ts);
+            self.dispatch_module_response(peer, method, payload, result, ts);
             return;
         }
         if let Some(m) = self.modules.get(ns) {
-            m.lock().unwrap().handle_response(peer, method, payload, ok, ts);
+            m.lock().unwrap().handle_response(peer, method, payload, result, ts);
         }
     }
 
@@ -734,9 +716,9 @@ impl Node {
         &mut self,
         peer: &str,
         method: &str,
-        payload: Option<Value>,
-        ok: bool,
-        ts: i64,
+        _payload: Option<Value>,
+        result: i8,
+        _ts: i64,
     ) {
         match method {
             "connect" => {
@@ -744,19 +726,17 @@ impl Node {
                     Some(lk) => lk,
                     None => return,
                 };
-                if ok {
+                if result > 0 {
                     let root = lk.state.root.clone().unwrap_or_default();
-                    // 1. Call module handler first (notification).
-                    if let Some(m) = self.modules.get(root.as_str()) {
-                        let method = m.lock().unwrap().connects_on().to_string();
-                        m.lock().unwrap().handle_response(peer, &method, payload, true, ts);
-                    }
-                    // 2. Common state logic.
-                    let lk = self.links.get_mut(peer).unwrap();
+                    // Set state to Connected.
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
                     if self.so_types.get(&root).map_or(false, |c| c.has_so) {
                         self.create_root_so(peer, &root);
+                    }
+                    // Notify module.
+                    if let Some(m) = self.modules.get(root.as_str()) {
+                        m.lock().unwrap().on_connect(peer);
                     }
                 } else {
                     lk.state.conn.status = Some(ConnectionStatus::Waiting);
@@ -764,8 +744,7 @@ impl Node {
                 }
             }
             "close" => {
-                if ok {
-                    let close_payload = payload;
+                if result > 0 {
                     if let Some(lk) = self.links.get(peer) {
                         let mod_names: Vec<String> = lk
                             .state
@@ -777,18 +756,15 @@ impl Node {
                             .map(|(n, _)| n.clone())
                             .collect();
                         let root = lk.state.root.clone().unwrap_or_default();
-                        // Notify modules of close.
+                        // Notify child modules of close (children first).
                         for name in &mod_names {
                             if let Some(m) = self.modules.get(name.as_str()) {
-                                let close_method = m.lock().unwrap().closes_on().first()
-                                    .unwrap_or(&"close").to_string();
-                                m.lock().unwrap().handle_response(peer, &close_method, close_payload.clone(), true, ts);
+                                m.lock().unwrap().on_close(peer);
                             }
                         }
+                        // Notify root module of close.
                         if let Some(m) = self.modules.get(root.as_str()) {
-                            let close_method = m.lock().unwrap().closes_on().first()
-                                .unwrap_or(&"close").to_string();
-                            m.lock().unwrap().handle_response(peer, &close_method, close_payload, true, ts);
+                            m.lock().unwrap().on_close(peer);
                         }
                     }
                     self.links.remove(peer);
@@ -807,8 +783,8 @@ impl Node {
         peer: &str,
         method: &str,
         payload: Option<Value>,
-        ok: bool,
-        ts: i64,
+        result: i8,
+        _ts: i64,
     ) {
         let name: String = payload
             .as_ref()
@@ -829,17 +805,14 @@ impl Node {
                     Some(s) => s,
                     None => return,
                 };
-                if ok {
-                    // 1. Call module handler first (notification).
-                    if let Some(m) = self.modules.get(name.as_str()) {
-                        let method = m.lock().unwrap().connects_on().to_string();
-                        m.lock().unwrap().handle_response(peer, &method, payload, true, ts);
-                    }
-                    // 2. Common state logic.
-                    let lk = self.links.get_mut(peer).unwrap();
-                    let mod_state = lk.state.modules.get_mut(&name).unwrap();
+                if result > 0 {
+                    // Set state to Connected.
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
+                    // Notify module.
+                    if let Some(m) = self.modules.get(name.as_str()) {
+                        m.lock().unwrap().on_connect(peer);
+                    }
                 } else {
                     mod_state.status = Some(ConnectionStatus::Waiting);
                     mod_state.intent_connect = false;
@@ -854,15 +827,14 @@ impl Node {
                     Some(s) => s,
                     None => return,
                 };
-                if ok {
+                if result > 0 {
                     let was_connected =
                         mod_state.status == Some(ConnectionStatus::Connected);
                     lk.state.modules.remove(&name);
                     if was_connected {
+                        // Notify module of close.
                         if let Some(m) = self.modules.get(name.as_str()) {
-                            let close_method = m.lock().unwrap().closes_on().first()
-                                .unwrap_or(&"close").to_string();
-                            m.lock().unwrap().handle_response(peer, &close_method, payload, true, ts);
+                            m.lock().unwrap().on_close(peer);
                         }
                     }
                 } else {
@@ -886,7 +858,7 @@ impl Node {
         if !self.links.contains_key(&peer) {
             if env.method == "link.close" {
                 return Ok(TxResponse {
-                    ok: true,
+                    result: 1,
                     timestamp: now_secs(),
                 });
             }
@@ -907,7 +879,7 @@ impl Node {
             }
             if self.connect_mode_for(root_name) == ConnectMode::Closed {
                 return Ok(TxResponse {
-                    ok: false,
+                    result: 0,
                     timestamp: now_secs(),
                 });
             }
@@ -945,11 +917,11 @@ impl Node {
                     pending_so_id,
                     &pending_method,
                     pending_payload,
-                    resp.ok,
+                    resp.result,
                     resp.timestamp,
                 );
 
-                self.auto_connect_on_response(pending_queue_id, resp.ok, &peer);
+                self.auto_connect_on_response(pending_queue_id, resp.result > 0, &peer);
 
                 if pending_queue_id != 0 {
                     self.registry.lock().unwrap().dequeue(pending_queue_id);
@@ -961,7 +933,7 @@ impl Node {
                     lk.accept_response(resp.timestamp);
                     counter
                 };
-                if resp.ok {
+                if resp.result > 0 {
                     self.finalize_pending_children(&peer, piggybacked_counter);
                 } else {
                     self.handle_nacked_children(&peer);
@@ -995,16 +967,16 @@ impl Node {
             .validate_timestamp(ts, now)?;
 
         // Dispatch request with so_id.
-        let ok = self.dispatch_request(&peer, env.so_id, &env.method, env.payload.clone(), ts)?;
+        let result = self.dispatch_request(&peer, env.so_id, &env.method, env.payload.clone(), ts)?;
 
         let (tx_counter, response) = {
             let lk = self.links.get_mut(&peer).unwrap();
             let counter = lk.counter;
-            let response = lk.accept_request(ok, ts);
+            let response = lk.accept_request(result, ts);
             (counter, response)
         };
 
-        if response.ok {
+        if response.result > 0 {
             self.finalize_pending_children(&peer, tx_counter);
         }
 
@@ -1244,9 +1216,9 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::{HandleResult, Module};
+    use crate::module::Module;
 
-    /// Minimal test module (legacy Module trait).
+    /// Minimal test module.
     struct TestModule {
         connected_peers: Vec<String>,
         closed_peers: Vec<String>,
@@ -1262,40 +1234,32 @@ mod tests {
     }
 
     impl Module for TestModule {
+        fn on_connect(&mut self, peer: &str) {
+            self.connected_peers.push(peer.to_string());
+        }
+        fn on_close(&mut self, peer: &str) {
+            self.closed_peers.push(peer.to_string());
+        }
         fn handle_request(
             &mut self,
-            peer: &str,
-            method: &str,
+            _peer: &str,
+            _method: &str,
             _payload: Option<Value>,
             _ts: i64,
-        ) -> Result<HandleResult, Box<dyn std::error::Error>> {
-            if method == self.connects_on() {
-                self.connected_peers.push(peer.to_string());
-            }
-            if self.closes_on().contains(&method) {
-                self.closed_peers.push(peer.to_string());
-            }
-            Ok(HandleResult { ok: true })
+        ) -> Result<i8, Box<dyn std::error::Error>> {
+            Ok(1)
         }
         fn handle_response(
             &mut self,
-            peer: &str,
-            method: &str,
+            _peer: &str,
+            _method: &str,
             _payload: Option<Value>,
-            ok: bool,
+            _result: i8,
             _ts: i64,
         ) {
-            if method == self.connects_on() && ok {
-                self.connected_peers.push(peer.to_string());
-            }
-            if self.closes_on().contains(&method) && ok {
-                self.closed_peers.push(peer.to_string());
-            }
         }
         fn force_remove(&mut self, peer: &str) {
-            let close_method = self.closes_on().first()
-                .unwrap_or(&"close").to_string();
-            let _ = self.handle_request(peer, &close_method, None, 0);
+            self.on_close(peer);
         }
         fn reattach_sync_objects(&mut self, _registry: &crate::registry::RegistryRef) {}
     }
@@ -1373,7 +1337,7 @@ mod tests {
         bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
+        assert!(resp.result > 0);
 
         let bob_lk = bob.get("alice@a.com").unwrap();
         assert_eq!(
@@ -1388,7 +1352,7 @@ mod tests {
             msg.so_id,
             &msg.method,
             msg.payload,
-            resp.ok,
+            resp.result,
             resp.timestamp,
         );
         let lk = alice.get_mut("bob@b.com").unwrap();
@@ -1415,7 +1379,7 @@ mod tests {
         let msg = node.next_tx("bob@b.com").unwrap();
         assert_eq!(msg.method, "link.close");
 
-        node.dispatch_response("bob@b.com", 0, "link.close", None, true, 100);
+        node.dispatch_response("bob@b.com", 0, "link.close", None, 1, 100);
         assert!(node.get("bob@b.com").is_none());
     }
 
@@ -1434,7 +1398,7 @@ mod tests {
         bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
+        assert!(resp.result > 0);
 
         // Bob should have a root SO instance in the table (data only, no handler).
         let bob_lk = bob.get("alice@a.com").unwrap();
@@ -1460,7 +1424,7 @@ mod tests {
         let msg = alice.next_tx("bob@b.com").unwrap();
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
+        assert!(resp.result > 0);
 
         // Get root SO id on bob.
         let root_so_id = {
@@ -1515,12 +1479,12 @@ mod tests {
         let msg = alice.next_tx("bob@b.com").unwrap();
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.ok);
+        assert!(resp.result > 0);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.pending = Some(msg.clone());
         }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.ok, resp.timestamp);
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.result, resp.timestamp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.accept_response(resp.timestamp);
@@ -1566,7 +1530,7 @@ mod tests {
         // (that's app-level logic, not tested here). The receiver-side
         // finalization only fires if the receiver also has a pending child.
         let bob_resp = bob.handle_incoming(&env).unwrap();
-        assert!(bob_resp.ok);
+        assert!(bob_resp.result > 0);
 
         // Alice processes the response — finalize_pending_children assigns
         // child.so_id = tx_counter.
@@ -1575,7 +1539,7 @@ mod tests {
             creating_msg.so_id,
             &creating_msg.method,
             creating_msg.payload,
-            bob_resp.ok,
+            bob_resp.result,
             bob_resp.timestamp,
         );
         // Simulate accept_response + finalize (normally in handle_incoming
@@ -1617,7 +1581,7 @@ mod tests {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.pending = Some(msg.clone());
         }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.ok, resp.timestamp);
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.result, resp.timestamp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.accept_response(resp.timestamp);
@@ -1677,7 +1641,7 @@ mod tests {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.pending = Some(msg.clone());
         }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.ok, resp.timestamp);
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.result, resp.timestamp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.accept_response(resp.timestamp);

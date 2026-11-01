@@ -254,7 +254,7 @@ fn is_zero(v: &u64) -> bool { *v == 0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxResponse {
-    pub ok: bool,
+    pub result: i8,
     pub timestamp: i64,
 }
 
@@ -422,8 +422,8 @@ impl Link {
     }
 
     /// Finalize an incoming request. Returns the response to send back.
-    pub fn accept_request(&mut self, ok: bool, ts: i64) -> TxResponse {
-        let resp = TxResponse { ok, timestamp: ts };
+    pub fn accept_request(&mut self, result: i8, ts: i64) -> TxResponse {
+        let resp = TxResponse { result, timestamp: ts };
         self.cached_response = Some(resp.clone());
         self.counter += 1;
         self.ts = ts;

@@ -798,7 +798,7 @@ impl Server {
                     true // need retry
                 } else {
                     // Dispatch response.
-                    n.dispatch_response(&peer, msg_so_id, &env.method, env.payload.clone(), resp.ok, resp.timestamp);
+                    n.dispatch_response(&peer, msg_so_id, &env.method, env.payload.clone(), resp.result, resp.timestamp);
 
                     // Dequeue from registry.
                     if msg_queue_id != 0 {

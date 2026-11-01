@@ -9,27 +9,23 @@
 //!
 //! ## Connect/close lifecycle
 //!
-//! Connect and close are regular req/resp messages. The module declares
-//! which method triggers connect (`connects_on`, default "connect") and
-//! which methods trigger close (`closes_on`, default ["close"]).
+//! Connect and close are handled by the framework via fixed `link.connect`
+//! and `link.close` methods. The module receives lifecycle callbacks:
 //!
-//! Flow:
-//! 1. Framework receives ACK/NACK for the registered connect method
-//! 2. Module's handle_request/handle_response runs (custom init/cleanup)
-//! 3. Framework runs common state logic (Connected/Waiting, fallback SO)
+//! - `on_connect(peer)` — called when a module becomes bilaterally
+//!   connected. Notification only — the module cannot reject.
+//! - `on_close(peer)` — called when a module is disconnected, just
+//!   before cleanup. The module should clean up per-peer state.
 //!
-//! If no custom handler exists, the framework default handles it.
+//! ## Tristate responses
+//!
+//! `handle_request` returns `i8`: 1 = ack, 0 = nack (app-level),
+//! error return = framework error (result -1, counter still advances).
 //!
 //! Account API (handle_account, status) is server-level routing,
 //! not sync framework — handled separately.
 
 use serde_json::Value;
-
-/// The result of handling an incoming sync request.
-pub struct HandleResult {
-    /// Whether the request was accepted (ACK) or rejected (NACK).
-    pub ok: bool,
-}
 
 /// Handler for a module.
 ///
@@ -40,36 +36,40 @@ pub struct HandleResult {
 /// framework. The Module handles all logic — dispatch, state, cross-SO
 /// effects, and account API.
 pub trait Module: Send + Sync {
-    /// Which method triggers connect for this module.
-    /// Default: "connect". Triad overrides to "commit".
-    /// The framework runs common state logic (set Connected/Waiting,
-    /// create fallback SO) AFTER the module's handle_request/handle_response.
-    fn connects_on(&self) -> &str {
-        "connect"
-    }
+    /// Called when a module becomes bilaterally connected — on
+    /// `link.connect` for the root module, on `module.connect` for
+    /// child modules. Notification only (cannot reject).
+    /// Modules use this to create per-peer state.
+    fn on_connect(&mut self, peer: &str) {}
 
-    /// Which methods trigger close for this module.
-    /// Default: ["close"]. Triad overrides to ["finalize", "cleanup", "cancel"].
-    /// The framework runs common state logic AFTER the module's handler.
-    fn closes_on(&self) -> Vec<&str> {
-        vec!["close"]
-    }
+    /// Called when a module is disconnected — on `module.close` for
+    /// child modules, on `link.close` for all connected modules
+    /// (children first, then root), just before cleanup.
+    /// Modules use this to clean up per-peer state.
+    fn on_close(&mut self, peer: &str) {}
 
+    /// Handle an incoming sync request. Returns tristate i8:
+    /// 1 = ack (accept), 0 = nack (reject, app-level).
+    /// Error return = framework error (counter advances, result -1).
     fn handle_request(
         &mut self,
         peer: &str,
         method: &str,
         payload: Option<Value>,
         ts: i64,
-    ) -> Result<HandleResult, Box<dyn std::error::Error>>;
+    ) -> Result<i8, Box<dyn std::error::Error>>;
+
+    /// Handle a response to a previously sent request.
+    /// `result` is the peer's tristate: 1 = ack, 0 = nack, -1 = error.
     fn handle_response(
         &mut self,
         peer: &str,
         method: &str,
         payload: Option<Value>,
-        ok: bool,
+        result: i8,
         ts: i64,
     );
+
     fn handle_account(
         &mut self,
         _method: &str,
