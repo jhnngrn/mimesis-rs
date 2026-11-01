@@ -334,6 +334,18 @@ impl Node {
         }
     }
 
+    /// Create a modul-SO for a module. If has_so is true, creates a real
+    /// SyncObject with send/has_pending wired to the registry. Otherwise
+    /// returns a zero-value SyncObject (no-op send/has_pending).
+    /// The module owns the returned SO — Drop auto-unregisters.
+    fn create_module_so(&self, peer: &str, module_name: &str) -> crate::sync_object::SyncObject<()> {
+        if self.so_types.get(module_name).map_or(false, |c| c.has_so) {
+            crate::sync_object::SyncObject::new((), peer, &self.registry, module_name)
+        } else {
+            crate::sync_object::SyncObject::without_registry((), peer)
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Pending child finalization — assign so_id = counter after transaction
     // -----------------------------------------------------------------------
@@ -527,9 +539,10 @@ impl Node {
                     if self.so_types.get(&root).map_or(false, |c| c.has_so) {
                         self.create_root_so(peer, &root);
                     }
-                    // Notify module.
+                    // Notify module with modul-SO.
+                    let so = self.create_module_so(peer, &root);
                     if let Some(m) = self.modules.get(root.as_str()) {
-                        m.lock().unwrap().on_connect(peer);
+                        m.lock().unwrap().on_connect(peer, so);
                     }
                     return Ok(1);
                 }
@@ -612,9 +625,10 @@ impl Node {
                     let mod_state = lk.state.modules.get_mut(&name).unwrap();
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
-                    // Notify module.
+                    // Notify module with modul-SO.
+                    let so = self.create_module_so(peer, &name);
                     if let Some(m) = self.modules.get(name.as_str()) {
-                        m.lock().unwrap().on_connect(peer);
+                        m.lock().unwrap().on_connect(peer, so);
                     }
                     return Ok(1);
                 }
@@ -623,9 +637,10 @@ impl Node {
                     let lk = self.links.get_mut(peer).unwrap();
                     let mod_state = lk.state.modules.get_mut(&name).unwrap();
                     mod_state.status = Some(ConnectionStatus::Connected);
-                    // Notify module.
+                    // Notify module with modul-SO.
+                    let so = self.create_module_so(peer, &name);
                     if let Some(m) = self.modules.get(name.as_str()) {
-                        m.lock().unwrap().on_connect(peer);
+                        m.lock().unwrap().on_connect(peer, so);
                     }
                     return Ok(1);
                 }
@@ -734,9 +749,10 @@ impl Node {
                     if self.so_types.get(&root).map_or(false, |c| c.has_so) {
                         self.create_root_so(peer, &root);
                     }
-                    // Notify module.
+                    // Notify module with modul-SO.
+                    let so = self.create_module_so(peer, &root);
                     if let Some(m) = self.modules.get(root.as_str()) {
-                        m.lock().unwrap().on_connect(peer);
+                        m.lock().unwrap().on_connect(peer, so);
                     }
                 } else {
                     lk.state.conn.status = Some(ConnectionStatus::Waiting);
@@ -809,9 +825,10 @@ impl Node {
                     // Set state to Connected.
                     mod_state.status = Some(ConnectionStatus::Connected);
                     mod_state.intent_connect = false;
-                    // Notify module.
+                    // Notify module with modul-SO.
+                    let so = self.create_module_so(peer, &name);
                     if let Some(m) = self.modules.get(name.as_str()) {
-                        m.lock().unwrap().on_connect(peer);
+                        m.lock().unwrap().on_connect(peer, so);
                     }
                 } else {
                     mod_state.status = Some(ConnectionStatus::Waiting);
@@ -1234,7 +1251,7 @@ mod tests {
     }
 
     impl Module for TestModule {
-        fn on_connect(&mut self, peer: &str) {
+        fn on_connect(&mut self, peer: &str, _so: crate::sync_object::SyncObject<()>) {
             self.connected_peers.push(peer.to_string());
         }
         fn on_close(&mut self, peer: &str) {

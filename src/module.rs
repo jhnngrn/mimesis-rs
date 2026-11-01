@@ -12,8 +12,10 @@
 //! Connect and close are handled by the framework via fixed `link.connect`
 //! and `link.close` methods. The module receives lifecycle callbacks:
 //!
-//! - `on_connect(peer)` — called when a module becomes bilaterally
+//! - `on_connect(peer, so)` — called when a module becomes bilaterally
 //!   connected. Notification only — the module cannot reject.
+//!   Modules with `has_so` receive a framework-managed SyncObject;
+//!   others receive a zero-value (no-op send/has_pending).
 //! - `on_close(peer)` — called when a module is disconnected, just
 //!   before cleanup. The module should clean up per-peer state.
 //!
@@ -27,6 +29,8 @@
 
 use serde_json::Value;
 
+use crate::sync_object::SyncObject;
+
 /// Handler for a module.
 ///
 /// Each module type implements this trait. The framework creates instances
@@ -39,8 +43,14 @@ pub trait Module: Send + Sync {
     /// Called when a module becomes bilaterally connected — on
     /// `link.connect` for the root module, on `module.connect` for
     /// child modules. Notification only (cannot reject).
-    /// Modules use this to create per-peer state.
-    fn on_connect(&mut self, peer: &str) {}
+    ///
+    /// Modules registered with `has_so` receive a framework-managed
+    /// SyncObject with send/has_pending wired. Others receive a
+    /// zero-value SyncObject (no registry — send/has_pending are no-ops).
+    /// Modules use this to create per-peer state and embed the SO.
+    fn on_connect(&mut self, peer: &str, so: SyncObject<()>) {
+        let _ = so; // default: ignore
+    }
 
     /// Called when a module is disconnected — on `module.close` for
     /// child modules, on `link.close` for all connected modules
