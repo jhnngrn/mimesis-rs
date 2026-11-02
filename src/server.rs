@@ -705,42 +705,35 @@ impl Server {
                     None => return, // Nothing to send.
                 };
 
-                let lk = match n.links.get(&peer) {
+                let node_id_clone = n.id.clone();
+                let msg_so_id = msg.so_id;
+                let q_id = msg.queue_id;
+
+                let lk = match n.links.get_mut(&peer) {
                     Some(lk) => lk,
                     None => return,
                 };
 
-                let mut env = TxRequest {
-                    from: n.id.clone(),
+                // Piggyback cached result.
+                let resp_piggyback = lk.cached_result;
+
+                // Promote to pending and set timestamp.
+                lk.pending = Some(msg);
+                let ts = now_secs();
+                if ts > lk.ts {
+                    lk.ts = ts;
+                }
+
+                let env = TxRequest {
+                    from: node_id_clone,
                     to: peer.clone(),
                     counter: lk.counter,
-                    so_id: msg.so_id,
-                    method: msg.method.clone(),
-                    payload: msg.payload.clone(),
-                    timestamp: 0,
-                    resp: None,
+                    so_id: msg_so_id,
+                    method: lk.pending.as_ref().unwrap().method.clone(),
+                    payload: lk.pending.as_ref().unwrap().payload.clone(),
+                    timestamp: lk.ts,
+                    resp: resp_piggyback,
                 };
-
-                // Dominant side sets timestamp.
-                if lk.dominant() {
-                    env.timestamp = now_secs();
-                    if env.timestamp < lk.ts {
-                        env.timestamp = lk.ts;
-                    }
-                }
-
-                // Piggyback cached result.
-                if let Some(cr) = lk.cached_result {
-                    env.resp = Some(cr);
-                }
-
-                let msg_so_id = msg.so_id;
-                let q_id = msg.queue_id;
-
-                // Promote to pending.
-                if let Some(lk) = n.links.get_mut(&peer) {
-                    lk.pending = Some(msg);
-                }
 
                 // Persist after promoting.
                 let node_id = n.id.clone();
@@ -798,7 +791,7 @@ impl Server {
 
                 // Accept response (increments counter, clears pending/cached_result).
                 if let Some(lk) = n.links.get_mut(&peer) {
-                    lk.accept_response(env.timestamp);
+                    lk.accept_response();
                 }
 
                 // Persist.

@@ -935,7 +935,7 @@ impl Node {
                 let piggybacked_counter = {
                     let lk = self.links.get_mut(&peer).unwrap();
                     let counter = lk.counter;
-                    lk.accept_response(env.timestamp);
+                    lk.accept_response();
                     counter
                 };
                 if resp > 0 {
@@ -1189,10 +1189,6 @@ impl Node {
     /// Build the wire envelope for sending.
     pub fn build_request(&self, peer: &str, msg: &QueuedMsg) -> Option<TxRequest> {
         let lk = self.links.get(peer)?;
-        let mut ts = now_secs();
-        if ts < lk.ts {
-            ts = lk.ts;
-        }
         Some(TxRequest {
             from: self.id.clone(),
             to: peer.to_string(),
@@ -1200,7 +1196,7 @@ impl Node {
             so_id: msg.so_id,
             method: msg.method.clone(),
             payload: msg.payload.clone(),
-            timestamp: ts,
+            timestamp: lk.ts,
             resp: lk.cached_result,
         })
     }
@@ -1347,7 +1343,7 @@ mod tests {
             resp,
         );
         let lk = alice.get_mut("bob@b.com").unwrap();
-        lk.accept_response(100);
+        lk.accept_response();
 
         let alice_lk = alice.get("bob@b.com").unwrap();
         assert_eq!(
@@ -1478,7 +1474,7 @@ mod tests {
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(100);
+            lk.accept_response();
         }
 
         // Get root SO id on alice.
@@ -1536,7 +1532,7 @@ mod tests {
         // for piggybacked responses, here we do it manually).
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(100);
+            lk.accept_response();
         }
         // Call finalize manually since we're outside handle_incoming.
         alice.finalize_pending_children("bob@b.com", tx_counter);
@@ -1574,7 +1570,7 @@ mod tests {
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(100);
+            lk.accept_response();
         }
 
         let root_so_id = {
@@ -1634,7 +1630,7 @@ mod tests {
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(100);
+            lk.accept_response();
         }
 
         let root_so_id = {

@@ -440,11 +440,8 @@ impl Link {
     }
 
     /// Finalize a received response to our outgoing message.
-    pub fn accept_response(&mut self, ts: i64) {
+    pub fn accept_response(&mut self) {
         self.counter += 1;
-        if ts > self.ts {
-            self.ts = ts;
-        }
         self.pending = None;
         self.cached_result = None;
     }
