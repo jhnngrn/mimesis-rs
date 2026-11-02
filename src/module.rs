@@ -77,7 +77,6 @@ pub trait Module: Send + Sync {
         method: &str,
         payload: Option<Value>,
         result: i8,
-        ts: i64,
     );
 
     fn handle_account(

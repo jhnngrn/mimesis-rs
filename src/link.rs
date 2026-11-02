@@ -247,16 +247,10 @@ pub struct TxRequest {
     pub payload: Option<serde_json::Value>,
     pub timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resp: Option<TxResponse>,
+    pub resp: Option<i8>,
 }
 
 fn is_zero(v: &u64) -> bool { *v == 0 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TxResponse {
-    pub result: i8,
-    pub timestamp: i64,
-}
 
 // ---------------------------------------------------------------------------
 // Outbox entry
@@ -304,7 +298,7 @@ pub struct Link {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending: Option<QueuedMsg>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_response: Option<TxResponse>,
+    pub cached_result: Option<i8>,
     #[serde(default)]
     pub ts: i64,
 }
@@ -313,8 +307,8 @@ pub struct Link {
 pub enum ValidateResult {
     /// Valid — proceed with dispatch.
     Ok,
-    /// Stale counter but cached response exists — resend it.
-    Cached(TxResponse),
+    /// Stale counter but cached result exists — resend it.
+    Cached(i8),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -349,7 +343,7 @@ impl Link {
             counter: 0,
             turn_bit: bit,
             pending: None,
-            cached_response: None,
+            cached_result: None,
             ts: 0,
         }
     }
@@ -394,9 +388,9 @@ impl Link {
     /// Validate an incoming request at the given counter.
     pub fn validate_request(&self, counter: u64) -> Result<ValidateResult, SyncError> {
         if counter < self.counter {
-            if let Some(ref cr) = self.cached_response {
+            if let Some(cr) = self.cached_result {
                 if counter == self.counter - 1 {
-                    return Ok(ValidateResult::Cached(cr.clone()));
+                    return Ok(ValidateResult::Cached(cr));
                 }
             }
             return Err(SyncError::StaleCounter);
@@ -421,14 +415,13 @@ impl Link {
         Ok(())
     }
 
-    /// Finalize an incoming request. Returns the response to send back.
-    pub fn accept_request(&mut self, result: i8, ts: i64) -> TxResponse {
-        let resp = TxResponse { result, timestamp: ts };
-        self.cached_response = Some(resp.clone());
+    /// Finalize an incoming request. Returns the result to send back.
+    pub fn accept_request(&mut self, result: i8, ts: i64) -> i8 {
+        self.cached_result = Some(result);
         self.counter += 1;
         self.ts = ts;
         self.pending = None;
-        resp
+        result
     }
 
     /// True if an SO instance is connected.
@@ -449,9 +442,11 @@ impl Link {
     /// Finalize a received response to our outgoing message.
     pub fn accept_response(&mut self, ts: i64) {
         self.counter += 1;
-        self.ts = ts;
+        if ts > self.ts {
+            self.ts = ts;
+        }
         self.pending = None;
-        self.cached_response = None;
+        self.cached_result = None;
     }
 }
 

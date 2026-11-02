@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::identity::{identity_in_domain, parse_identity, valid_username};
-use crate::link::{SyncError, TxRequest, TxResponse};
+use crate::link::{SyncError, TxRequest};
 use crate::module::Module;
 use crate::node::Node;
 use crate::store::{FileStore, Store, UserRecord};
@@ -667,7 +667,7 @@ impl Server {
         &self,
         peer_domain: &str,
         msg: &TxRequest,
-    ) -> Result<TxResponse, Box<dyn std::error::Error>> {
+    ) -> Result<i8, Box<dyn std::error::Error>> {
         let body = serde_json::to_vec(msg)?;
         let sig = self.sign("/p2p/tx", &body);
         let url = format!("{}://{}/p2p/tx", self.cfg.peer_scheme, peer_domain);
@@ -683,8 +683,8 @@ impl Server {
         if !resp.status().is_success() {
             return Err(format!("peer {} returned {}", peer_domain, resp.status()).into());
         }
-        let tx_resp: TxResponse = resp.json().await?;
-        Ok(tx_resp)
+        let result: i8 = resp.json().await?;
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -729,9 +729,9 @@ impl Server {
                     }
                 }
 
-                // Piggyback cached response.
-                if let Some(ref cr) = lk.cached_response {
-                    env.resp = Some(cr.clone());
+                // Piggyback cached result.
+                if let Some(cr) = lk.cached_result {
+                    env.resp = Some(cr);
                 }
 
                 let msg_so_id = msg.so_id;
@@ -774,7 +774,7 @@ impl Server {
             };
 
             // Phase 3: Lock, process response, dequeue, accept, continue loop.
-            let need_retry = {
+            {
                 let mut n = node.lock().unwrap();
 
                 // Validate link still exists and pending matches.
@@ -787,42 +787,24 @@ impl Server {
                     return; // Link changed while we were sending.
                 }
 
-                // Validate response timestamp.
-                let bad_ts = n.links.get(&peer)
-                    .map(|lk| lk.validate_timestamp(resp.timestamp, now_secs()).is_err())
-                    .unwrap_or(false);
-                if bad_ts {
-                    if self.cfg.verbose {
-                        eprintln!("[send] {}→{}: bad response timestamp", n.id, peer);
-                    }
-                    true // need retry
-                } else {
-                    // Dispatch response.
-                    n.dispatch_response(&peer, msg_so_id, &env.method, env.payload.clone(), resp.result, resp.timestamp);
+                // Dispatch response.
+                n.dispatch_response(&peer, msg_so_id, &env.method, env.payload.clone(), resp);
 
-                    // Dequeue from registry.
-                    if msg_queue_id != 0 {
-                        let reg = n.registry();
-                        reg.lock().unwrap().dequeue(msg_queue_id);
-                    }
-
-                    // Accept response (increments counter, clears pending/cached_response).
-                    if let Some(lk) = n.links.get_mut(&peer) {
-                        lk.accept_response(resp.timestamp);
-                    }
-
-                    // Persist.
-                    let node_id = n.id.clone();
-                    drop(n);
-                    let _ = self.commit_node(&node_id);
-
-                    false // no retry needed
+                // Dequeue from registry.
+                if msg_queue_id != 0 {
+                    let reg = n.registry();
+                    reg.lock().unwrap().dequeue(msg_queue_id);
                 }
-            }; // MutexGuard dropped here, before any await.
 
-            if need_retry {
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
+                // Accept response (increments counter, clears pending/cached_result).
+                if let Some(lk) = n.links.get_mut(&peer) {
+                    lk.accept_response(env.timestamp);
+                }
+
+                // Persist.
+                let node_id = n.id.clone();
+                drop(n);
+                let _ = self.commit_node(&node_id);
             }
             // Loop back to check for more messages.
         }

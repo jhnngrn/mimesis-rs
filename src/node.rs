@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::link::{
     ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
-    SyncError, TxRequest, TxResponse, ValidateResult, now_secs,
+    SyncError, TxRequest, ValidateResult, now_secs,
 };
 use crate::module::Module;
 use crate::registry::{self, RegistryRef};
@@ -697,7 +697,6 @@ impl Node {
         full_method: &str,
         payload: Option<Value>,
         result: i8,
-        ts: i64,
     ) {
         // SO-id based routing: route to Module by SO type.
         if so_id > 0 {
@@ -706,7 +705,7 @@ impl Node {
                 .map(|inst| inst.so_type.clone());
             if let Some(so_type) = so_type {
                 if let Some(m) = self.modules.get(&so_type) {
-                    m.lock().unwrap().handle_response(peer, full_method, payload, result, ts);
+                    m.lock().unwrap().handle_response(peer, full_method, payload, result);
                 }
             }
             return;
@@ -715,15 +714,15 @@ impl Node {
         // Legacy namespace-based routing.
         let (ns, method) = split_method(full_method);
         if ns == "link" {
-            self.dispatch_link_response(peer, method, payload, result, ts);
+            self.dispatch_link_response(peer, method, payload, result);
             return;
         }
         if ns == "module" {
-            self.dispatch_module_response(peer, method, payload, result, ts);
+            self.dispatch_module_response(peer, method, payload, result);
             return;
         }
         if let Some(m) = self.modules.get(ns) {
-            m.lock().unwrap().handle_response(peer, method, payload, result, ts);
+            m.lock().unwrap().handle_response(peer, method, payload, result);
         }
     }
 
@@ -733,7 +732,6 @@ impl Node {
         method: &str,
         _payload: Option<Value>,
         result: i8,
-        _ts: i64,
     ) {
         match method {
             "connect" => {
@@ -800,7 +798,6 @@ impl Node {
         method: &str,
         payload: Option<Value>,
         result: i8,
-        _ts: i64,
     ) {
         let name: String = payload
             .as_ref()
@@ -868,16 +865,13 @@ impl Node {
     // Handle incoming — the full sync receive path
     // -----------------------------------------------------------------------
 
-    pub fn handle_incoming(&mut self, env: &TxRequest) -> Result<TxResponse, SyncError> {
+    pub fn handle_incoming(&mut self, env: &TxRequest) -> Result<i8, SyncError> {
         let peer = env.from.to_lowercase();
 
         // No link — handle link.connect and link.close specially.
         if !self.links.contains_key(&peer) {
             if env.method == "link.close" {
-                return Ok(TxResponse {
-                    result: 1,
-                    timestamp: now_secs(),
-                });
+                return Ok(1);
             }
             if env.method != "link.connect" {
                 return Err(SyncError::NoLink);
@@ -895,10 +889,7 @@ impl Node {
                 )));
             }
             if self.connect_mode_for(root_name) == ConnectMode::Closed {
-                return Ok(TxResponse {
-                    result: 0,
-                    timestamp: now_secs(),
-                });
+                return Ok(0);
             }
             if self.links.len() >= MAX_LINKS {
                 return Err(SyncError::MaxLinks);
@@ -911,11 +902,9 @@ impl Node {
         let now = now_secs();
 
         // Piggybacked response.
-        if let Some(ref resp) = env.resp {
+        if let Some(resp) = env.resp {
             let lk = self.links.get(&peer).unwrap();
             if lk.pending.is_some() && env.counter == lk.counter + 1 {
-                lk.validate_timestamp(resp.timestamp, now)?;
-
                 let pending_so_id;
                 let pending_method;
                 let pending_payload;
@@ -934,11 +923,10 @@ impl Node {
                     pending_so_id,
                     &pending_method,
                     pending_payload,
-                    resp.result,
-                    resp.timestamp,
+                    resp,
                 );
 
-                self.auto_connect_on_response(pending_queue_id, resp.result > 0, &peer);
+                self.auto_connect_on_response(pending_queue_id, resp > 0, &peer);
 
                 if pending_queue_id != 0 {
                     self.registry.lock().unwrap().dequeue(pending_queue_id);
@@ -947,10 +935,10 @@ impl Node {
                 let piggybacked_counter = {
                     let lk = self.links.get_mut(&peer).unwrap();
                     let counter = lk.counter;
-                    lk.accept_response(resp.timestamp);
+                    lk.accept_response(env.timestamp);
                     counter
                 };
-                if resp.result > 0 {
+                if resp > 0 {
                     self.finalize_pending_children(&peer, piggybacked_counter);
                 } else {
                     self.handle_nacked_children(&peer);
@@ -967,16 +955,7 @@ impl Node {
             }
         }
 
-        let lk = self.links.get(&peer).unwrap();
-        let ts = if lk.dominant() {
-            let mut t = now;
-            if t < lk.ts {
-                t = lk.ts;
-            }
-            t
-        } else {
-            env.timestamp
-        };
+        let ts = env.timestamp;
 
         self.links
             .get(&peer)
@@ -993,7 +972,7 @@ impl Node {
             (counter, response)
         };
 
-        if response.result > 0 {
+        if response > 0 {
             self.finalize_pending_children(&peer, tx_counter);
         }
 
@@ -1210,12 +1189,9 @@ impl Node {
     /// Build the wire envelope for sending.
     pub fn build_request(&self, peer: &str, msg: &QueuedMsg) -> Option<TxRequest> {
         let lk = self.links.get(peer)?;
-        let mut ts = 0i64;
-        if lk.dominant() {
-            ts = now_secs();
-            if ts < lk.ts {
-                ts = lk.ts;
-            }
+        let mut ts = now_secs();
+        if ts < lk.ts {
+            ts = lk.ts;
         }
         Some(TxRequest {
             from: self.id.clone(),
@@ -1225,7 +1201,7 @@ impl Node {
             method: msg.method.clone(),
             payload: msg.payload.clone(),
             timestamp: ts,
-            resp: lk.cached_response.clone(),
+            resp: lk.cached_result,
         })
     }
 }
@@ -1272,7 +1248,6 @@ mod tests {
             _method: &str,
             _payload: Option<Value>,
             _result: i8,
-            _ts: i64,
         ) {
         }
         fn force_remove(&mut self, peer: &str) {
@@ -1354,7 +1329,7 @@ mod tests {
         bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.result > 0);
+        assert!(resp > 0);
 
         let bob_lk = bob.get("alice@a.com").unwrap();
         assert_eq!(
@@ -1369,11 +1344,10 @@ mod tests {
             msg.so_id,
             &msg.method,
             msg.payload,
-            resp.result,
-            resp.timestamp,
+            resp,
         );
         let lk = alice.get_mut("bob@b.com").unwrap();
-        lk.accept_response(resp.timestamp);
+        lk.accept_response(100);
 
         let alice_lk = alice.get("bob@b.com").unwrap();
         assert_eq!(
@@ -1396,7 +1370,7 @@ mod tests {
         let msg = node.next_tx("bob@b.com").unwrap();
         assert_eq!(msg.method, "link.close");
 
-        node.dispatch_response("bob@b.com", 0, "link.close", None, 1, 100);
+        node.dispatch_response("bob@b.com", 0, "link.close", None, 1);
         assert!(node.get("bob@b.com").is_none());
     }
 
@@ -1415,7 +1389,7 @@ mod tests {
         bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
 
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.result > 0);
+        assert!(resp > 0);
 
         // Bob should have a root SO instance in the table (data only, no handler).
         let bob_lk = bob.get("alice@a.com").unwrap();
@@ -1441,7 +1415,7 @@ mod tests {
         let msg = alice.next_tx("bob@b.com").unwrap();
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.result > 0);
+        assert!(resp > 0);
 
         // Get root SO id on bob.
         let root_so_id = {
@@ -1496,15 +1470,15 @@ mod tests {
         let msg = alice.next_tx("bob@b.com").unwrap();
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp.result > 0);
+        assert!(resp > 0);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.pending = Some(msg.clone());
         }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.result, resp.timestamp);
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(resp.timestamp);
+            lk.accept_response(100);
         }
 
         // Get root SO id on alice.
@@ -1547,7 +1521,7 @@ mod tests {
         // (that's app-level logic, not tested here). The receiver-side
         // finalization only fires if the receiver also has a pending child.
         let bob_resp = bob.handle_incoming(&env).unwrap();
-        assert!(bob_resp.result > 0);
+        assert!(bob_resp > 0);
 
         // Alice processes the response — finalize_pending_children assigns
         // child.so_id = tx_counter.
@@ -1556,14 +1530,13 @@ mod tests {
             creating_msg.so_id,
             &creating_msg.method,
             creating_msg.payload,
-            bob_resp.result,
-            bob_resp.timestamp,
+            bob_resp,
         );
         // Simulate accept_response + finalize (normally in handle_incoming
         // for piggybacked responses, here we do it manually).
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(bob_resp.timestamp);
+            lk.accept_response(100);
         }
         // Call finalize manually since we're outside handle_incoming.
         alice.finalize_pending_children("bob@b.com", tx_counter);
@@ -1598,10 +1571,10 @@ mod tests {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.pending = Some(msg.clone());
         }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.result, resp.timestamp);
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(resp.timestamp);
+            lk.accept_response(100);
         }
 
         let root_so_id = {
@@ -1658,10 +1631,10 @@ mod tests {
             let lk = alice.get_mut("bob@b.com").unwrap();
             lk.pending = Some(msg.clone());
         }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp.result, resp.timestamp);
+        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response(resp.timestamp);
+            lk.accept_response(100);
         }
 
         let root_so_id = {
