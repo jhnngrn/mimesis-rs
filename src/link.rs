@@ -404,9 +404,13 @@ impl Link {
         Ok(ValidateResult::Ok)
     }
 
-    /// Validate that timestamp is within acceptable bounds.
+    /// Validate that timestamp is within acceptable bounds:
+    /// monotonicity, not too far behind now, not too far ahead of now.
     pub fn validate_timestamp(&self, ts: i64, now: i64) -> Result<(), SyncError> {
         if ts < self.ts {
+            return Err(SyncError::Timestamp);
+        }
+        if ts < now - MAX_TIMESTAMP_FUTURE {
             return Err(SyncError::Timestamp);
         }
         if ts > now + MAX_TIMESTAMP_FUTURE {

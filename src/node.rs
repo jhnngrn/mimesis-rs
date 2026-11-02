@@ -1186,6 +1186,17 @@ impl Node {
         best
     }
 
+    /// Promote a message to pending and set the link timestamp.
+    /// Call after next_tx, before build_request.
+    pub fn promote_pending(&mut self, peer: &str, msg: QueuedMsg) {
+        let lk = self.links.get_mut(peer).expect("no link");
+        lk.pending = Some(msg);
+        let ts = now_secs();
+        if ts > lk.ts {
+            lk.ts = ts;
+        }
+    }
+
     /// Build the wire envelope for sending.
     pub fn build_request(&self, peer: &str, msg: &QueuedMsg) -> Option<TxRequest> {
         let lk = self.links.get(peer)?;
@@ -1318,6 +1329,7 @@ mod tests {
 
         let msg = alice.next_tx("bob@b.com").unwrap();
         assert_eq!(msg.method, "link.connect");
+        alice.promote_pending("bob@b.com", msg.clone());
         let env = alice.build_request("bob@b.com", &msg).unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
@@ -1332,9 +1344,6 @@ mod tests {
             bob_lk.state.conn.status,
             Some(ConnectionStatus::Connected)
         );
-
-        let lk = alice.get_mut("bob@b.com").unwrap();
-        lk.pending = Some(msg.clone());
         alice.dispatch_response(
             "bob@b.com",
             msg.so_id,
@@ -1378,6 +1387,7 @@ mod tests {
         alice.connect("bob@b.com", "trustline").unwrap();
 
         let msg = alice.next_tx("bob@b.com").unwrap();
+        alice.promote_pending("bob@b.com", msg.clone());
         let env = alice.build_request("bob@b.com", &msg).unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
@@ -1409,6 +1419,7 @@ mod tests {
         alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
         alice.connect("bob@b.com", "trustline").unwrap();
         let msg = alice.next_tx("bob@b.com").unwrap();
+        alice.promote_pending("bob@b.com", msg.clone());
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp > 0);
@@ -1464,12 +1475,11 @@ mod tests {
 
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
+        alice.promote_pending("bob@b.com", msg.clone());
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp > 0);
         {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.pending = Some(msg.clone());
         }
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
@@ -1506,11 +1516,8 @@ mod tests {
         let tx_counter = alice.get("bob@b.com").unwrap().counter;
 
         // Build and send to bob.
+        alice.promote_pending("bob@b.com", creating_msg.clone());
         let env = alice.build_request("bob@b.com", &creating_msg).unwrap();
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.pending = Some(creating_msg.clone());
-        }
 
         // Bob receives — handle_incoming calls finalize_pending_children.
         // Bob's parent handler gets the request but doesn't create a child
@@ -1561,12 +1568,9 @@ mod tests {
 
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
+        alice.promote_pending("bob@b.com", msg.clone());
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.pending = Some(msg.clone());
-        }
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
@@ -1621,12 +1625,9 @@ mod tests {
 
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
+        alice.promote_pending("bob@b.com", msg.clone());
         let env = alice.build_request("bob@b.com", &msg).unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.pending = Some(msg.clone());
-        }
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
             let lk = alice.get_mut("bob@b.com").unwrap();
