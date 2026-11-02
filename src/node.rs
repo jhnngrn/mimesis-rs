@@ -49,23 +49,6 @@ impl SoConfig {
     }
 }
 
-/// True if `msg` is older than `best` (for oldest-first selection).
-fn is_older(msg: &QueuedMsg, best: &Option<QueuedMsg>) -> bool {
-    match best {
-        None => true,
-        Some(b) => {
-            if msg.queued_at == 0 && b.queued_at == 0 {
-                false
-            } else if msg.queued_at == 0 {
-                false
-            } else if b.queued_at == 0 {
-                true
-            } else {
-                msg.queued_at < b.queued_at
-            }
-        }
-    }
-}
 
 /// Split "trustline.payment" → ("trustline", "payment").
 /// If no dot, returns ("", method).
@@ -867,7 +850,6 @@ impl Node {
                         so_id: 0,
                         method: "module.close".into(),
                         payload: Some(serde_json::json!({"name": name})),
-                        queued_at: 0,
                         queue_id: 0,
                         timestamp: 0,
                     });
@@ -881,7 +863,7 @@ impl Node {
                     so_id: 0,
                     method: "link.close".into(),
                     payload: None,
-                    queued_at: 0,
+
                     queue_id: 0,
                     timestamp: 0,
                 });
@@ -894,7 +876,7 @@ impl Node {
                 so_id: 0,
                 method: "link.close".into(),
                 payload: None,
-                queued_at: 0,
+
                 queue_id: 0,
                 timestamp: 0,
             });
@@ -906,7 +888,7 @@ impl Node {
                 so_id: 0,
                 method: "link.connect".into(),
                 payload: Some(serde_json::json!({"name": root})),
-                queued_at: 0,
+
                 queue_id: 0,
                 timestamp: 0,
             });
@@ -933,7 +915,7 @@ impl Node {
                     so_id: 0,
                     method: "module.close".into(),
                     payload: Some(serde_json::json!({"name": name})),
-                    queued_at: 0,
+
                     queue_id: 0,
                     timestamp: 0,
                 });
@@ -952,7 +934,7 @@ impl Node {
                 so_id: 0,
                 method: "module.connect".into(),
                 payload: Some(serde_json::json!({"name": name})),
-                queued_at: 0,
+
                 queue_id: 0,
                 timestamp: 0,
             });
@@ -963,6 +945,7 @@ impl Node {
         // Collect from registry outboxes — oldest entry wins.
         let reg = self.registry.lock().unwrap();
         let mut best: Option<QueuedMsg> = None;
+        let mut best_time: i64 = 0;
 
         // Module queues (namespace-routed).
         let connected_modules: Vec<String> = self
@@ -974,16 +957,15 @@ impl Node {
 
         for mod_name in &connected_modules {
             for candidate in reg.collect_outbox(mod_name, peer) {
-                let msg = QueuedMsg {
-                    so_id: 0,
-                    method: format!("{}.{}", mod_name, candidate.method),
-                    payload: candidate.payload,
-                    queued_at: candidate.queued_at,
-                    queue_id: candidate.queue_id,
-                    timestamp: 0,
-                };
-                if is_older(&msg, &best) {
-                    best = Some(msg);
+                if best.is_none() || candidate.queued_at < best_time {
+                    best_time = candidate.queued_at;
+                    best = Some(QueuedMsg {
+                        so_id: 0,
+                        method: format!("{}.{}", mod_name, candidate.method),
+                        payload: candidate.payload,
+                        queue_id: candidate.queue_id,
+                        timestamp: 0,
+                    });
                 }
             }
         }

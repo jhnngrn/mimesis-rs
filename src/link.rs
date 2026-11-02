@@ -179,8 +179,6 @@ pub struct QueuedMsg {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
-    #[serde(default)]
-    pub queued_at: i64,
     /// Registry queue ID (for dequeue after response).
     #[serde(default)]
     pub queue_id: u64,
