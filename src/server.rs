@@ -700,7 +700,7 @@ impl Server {
             // Phase 1: Lock, get next message, build envelope, unlock.
             let (env, msg_so_id, msg_queue_id) = {
                 let mut n = node.lock().unwrap();
-                let msg = match n.next_tx(&peer) {
+                let mut msg = match n.next_tx(&peer) {
                     Some(m) => m,
                     None => return, // Nothing to send.
                 };
@@ -717,12 +717,10 @@ impl Server {
                 // Piggyback cached result.
                 let resp_piggyback = lk.cached_result;
 
-                // Promote to pending and set timestamp.
-                lk.pending = Some(msg);
+                // Promote to pending — set msg timestamp, do NOT touch lk.ts.
                 let ts = now_secs();
-                if ts > lk.ts {
-                    lk.ts = ts;
-                }
+                msg.timestamp = if ts > lk.ts { ts } else { lk.ts };
+                lk.pending = Some(msg);
 
                 let env = TxRequest {
                     from: node_id_clone,
@@ -731,7 +729,7 @@ impl Server {
                     so_id: msg_so_id,
                     method: lk.pending.as_ref().unwrap().method.clone(),
                     payload: lk.pending.as_ref().unwrap().payload.clone(),
-                    timestamp: lk.ts,
+                    timestamp: lk.pending.as_ref().unwrap().timestamp,
                     resp: resp_piggyback,
                 };
 

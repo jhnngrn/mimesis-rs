@@ -1032,6 +1032,7 @@ impl Node {
                         payload: Some(serde_json::json!({"name": name})),
                         queued_at: 0,
                         queue_id: 0,
+                        timestamp: 0,
                     });
                 }
                 if mod_state.status == Some(ConnectionStatus::Connected) {
@@ -1045,6 +1046,7 @@ impl Node {
                     payload: None,
                     queued_at: 0,
                     queue_id: 0,
+                    timestamp: 0,
                 });
             }
             return None;
@@ -1057,6 +1059,7 @@ impl Node {
                 payload: None,
                 queued_at: 0,
                 queue_id: 0,
+                timestamp: 0,
             });
         }
 
@@ -1068,6 +1071,7 @@ impl Node {
                 payload: Some(serde_json::json!({"name": root})),
                 queued_at: 0,
                 queue_id: 0,
+                timestamp: 0,
             });
         }
 
@@ -1094,6 +1098,7 @@ impl Node {
                     payload: Some(serde_json::json!({"name": name})),
                     queued_at: 0,
                     queue_id: 0,
+                    timestamp: 0,
                 });
             }
         }
@@ -1112,6 +1117,7 @@ impl Node {
                 payload: Some(serde_json::json!({"name": name})),
                 queued_at: 0,
                 queue_id: 0,
+                timestamp: 0,
             });
         }
 
@@ -1130,6 +1136,7 @@ impl Node {
                             payload: child.payload.clone(),
                             queued_at: 0,
                             queue_id: 0,
+                            timestamp: 0,
                         });
                     }
                 }
@@ -1153,6 +1160,7 @@ impl Node {
                     payload: candidate.payload,
                     queued_at: candidate.queued_at,
                     queue_id: candidate.queue_id,
+                    timestamp: 0,
                 };
                 if is_older(&msg, &best) {
                     best = Some(msg);
@@ -1176,6 +1184,7 @@ impl Node {
                     payload: candidate.payload,
                     queued_at: candidate.queued_at,
                     queue_id: candidate.queue_id,
+                    timestamp: 0,
                 };
                 if is_older(&msg, &best) {
                     best = Some(msg);
@@ -1186,28 +1195,28 @@ impl Node {
         best
     }
 
-    /// Promote a message to pending and set the link timestamp.
-    /// Call after next_tx, before build_request.
-    pub fn promote_pending(&mut self, peer: &str, msg: QueuedMsg) {
+    /// Promote a message to pending. Sets the outgoing timestamp on the
+    /// message (max(now, lk.ts)) but does NOT update lk.ts — that happens
+    /// in accept_response after the peer confirms.
+    pub fn promote_pending(&mut self, peer: &str, mut msg: QueuedMsg) {
         let lk = self.links.get_mut(peer).expect("no link");
-        lk.pending = Some(msg);
         let ts = now_secs();
-        if ts > lk.ts {
-            lk.ts = ts;
-        }
+        msg.timestamp = if ts > lk.ts { ts } else { lk.ts };
+        lk.pending = Some(msg);
     }
 
     /// Build the wire envelope for sending.
-    pub fn build_request(&self, peer: &str, msg: &QueuedMsg) -> Option<TxRequest> {
+    pub fn build_request(&self, peer: &str) -> Option<TxRequest> {
         let lk = self.links.get(peer)?;
+        let pending = lk.pending.as_ref()?;
         Some(TxRequest {
             from: self.id.clone(),
             to: peer.to_string(),
             counter: lk.counter,
-            so_id: msg.so_id,
-            method: msg.method.clone(),
-            payload: msg.payload.clone(),
-            timestamp: lk.ts,
+            so_id: pending.so_id,
+            method: pending.method.clone(),
+            payload: pending.payload.clone(),
+            timestamp: pending.timestamp,
             resp: lk.cached_result,
         })
     }
@@ -1330,7 +1339,7 @@ mod tests {
         let msg = alice.next_tx("bob@b.com").unwrap();
         assert_eq!(msg.method, "link.connect");
         alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
@@ -1388,7 +1397,7 @@ mod tests {
 
         let msg = alice.next_tx("bob@b.com").unwrap();
         alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
 
         let mut bob = Node::new("bob@b.com".into());
         bob.declare_so("trustline", SoConfig::auto());
@@ -1420,7 +1429,7 @@ mod tests {
         alice.connect("bob@b.com", "trustline").unwrap();
         let msg = alice.next_tx("bob@b.com").unwrap();
         alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp > 0);
 
@@ -1476,7 +1485,7 @@ mod tests {
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
         alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
         assert!(resp > 0);
         {
@@ -1517,7 +1526,7 @@ mod tests {
 
         // Build and send to bob.
         alice.promote_pending("bob@b.com", creating_msg.clone());
-        let env = alice.build_request("bob@b.com", &creating_msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
 
         // Bob receives — handle_incoming calls finalize_pending_children.
         // Bob's parent handler gets the request but doesn't create a child
@@ -1569,7 +1578,7 @@ mod tests {
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
         alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {
@@ -1626,7 +1635,7 @@ mod tests {
         // Bilateral connect.
         let msg = alice.next_tx("bob@b.com").unwrap();
         alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com", &msg).unwrap();
+        let env = alice.build_request("bob@b.com").unwrap();
         let resp = bob.handle_incoming(&env).unwrap();
         alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
         {

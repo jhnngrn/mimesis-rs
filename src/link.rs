@@ -278,6 +278,10 @@ pub struct QueuedMsg {
     /// Registry queue ID (for dequeue after response).
     #[serde(default)]
     pub queue_id: u64,
+    /// Outgoing timestamp, set at promote time: max(now, lk.ts).
+    /// Only committed to lk.ts in accept_response after peer confirms.
+    #[serde(default)]
+    pub timestamp: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +448,12 @@ impl Link {
     }
 
     /// Finalize a received response to our outgoing message.
+    /// Commits pending.timestamp to lk.ts — the transaction is confirmed,
+    /// so it's safe to raise the monotonicity bar.
     pub fn accept_response(&mut self) {
+        if let Some(ref pending) = self.pending {
+            self.ts = pending.timestamp;
+        }
         self.counter += 1;
         self.pending = None;
         self.cached_result = None;
