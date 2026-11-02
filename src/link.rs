@@ -451,9 +451,8 @@ impl Link {
     /// Commits pending.timestamp to lk.ts — the transaction is confirmed,
     /// so it's safe to raise the monotonicity bar.
     pub fn accept_response(&mut self) {
-        if let Some(ref pending) = self.pending {
-            self.ts = pending.timestamp;
-        }
+        let pending = self.pending.as_ref().expect("accept_response called without pending");
+        self.ts = pending.timestamp;
         self.counter += 1;
         self.pending = None;
         self.cached_result = None;
