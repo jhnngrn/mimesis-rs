@@ -126,100 +126,6 @@ pub struct ConnectionState {
 
 fn is_false(v: &bool) -> bool { !*v }
 
-// ---------------------------------------------------------------------------
-// SoInstance — a single SO instance on a link, identified by bilateral ID
-// ---------------------------------------------------------------------------
-
-/// A child SO at any lifecycle stage.
-///
-/// - `so_id: None` → pending, not yet sent (lives in parent's children list)
-/// - `so_id: Some(id), status: None` → allocated but not bilateral yet
-/// - `so_id: Some(id), status: Some(Waiting)` → sent, waiting for ACK
-/// - `so_id: Some(id), status: Some(Connected)` → bilateral, active
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SoChild {
-    /// Bilateral ID. None = pending, not yet allocated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub so_id: Option<u64>,
-    /// SO type name (e.g. "novation").
-    pub so_type: String,
-    /// Connection status. None = not yet bilateral.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<ConnectionStatus>,
-    /// Method to send as the creating message (e.g. "commit").
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub method: String,
-    /// Payload for the creating message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
-}
-
-/// A sync object instance on a link. Each has a bilateral ID (the link
-/// counter at connect time), a type name, and an optional parent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SoInstance {
-    /// SO type name (e.g. "trustline", "novation").
-    pub so_type: String,
-    /// Parent SO's bilateral ID. None = root SO.
-    pub parent_id: Option<u64>,
-    /// Connection status.
-    pub status: ConnectionStatus,
-    /// Tracks child SO instances for lifecycle ref counting.
-    #[serde(skip)]
-    pub children: ChildTracker,
-    /// Child SOs at all lifecycle stages (pending through connected).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub so_children: Vec<SoChild>,
-}
-
-/// Table of SO instances on a link, keyed by bilateral ID.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SoTable {
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub instances: HashMap<u64, SoInstance>,
-}
-
-impl SoTable {
-    pub fn new() -> Self {
-        SoTable { instances: HashMap::new() }
-    }
-
-    /// Insert a new SO instance. Returns the old one if the ID was taken.
-    pub fn insert(&mut self, so_id: u64, instance: SoInstance) -> Option<SoInstance> {
-        self.instances.insert(so_id, instance)
-    }
-
-    /// Get an SO instance by bilateral ID.
-    pub fn get(&self, so_id: u64) -> Option<&SoInstance> {
-        self.instances.get(&so_id)
-    }
-
-    /// Get a mutable SO instance by bilateral ID.
-    pub fn get_mut(&mut self, so_id: u64) -> Option<&mut SoInstance> {
-        self.instances.get_mut(&so_id)
-    }
-
-    /// Remove an SO instance.
-    pub fn remove(&mut self, so_id: u64) -> Option<SoInstance> {
-        self.instances.remove(&so_id)
-    }
-
-    /// Find the root SO (parent_id = None).
-    pub fn root(&self) -> Option<(u64, &SoInstance)> {
-        self.instances.iter()
-            .find(|(_, inst)| inst.parent_id.is_none())
-            .map(|(&id, inst)| (id, inst))
-    }
-
-    /// All children of a given parent SO.
-    pub fn children_of(&self, parent_id: u64) -> Vec<(u64, &SoInstance)> {
-        self.instances.iter()
-            .filter(|(_, inst)| inst.parent_id == Some(parent_id))
-            .map(|(&id, inst)| (id, inst))
-            .collect()
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinkState {
     #[serde(flatten)]
@@ -294,9 +200,6 @@ pub const MAX_TIMESTAMP_FUTURE: i64 = 600;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub state: LinkState,
-    /// SO instances on this link, keyed by bilateral ID.
-    #[serde(default)]
-    pub so_table: SoTable,
     pub counter: u64,
     pub turn_bit: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,7 +246,6 @@ impl Link {
         let bit = if self_id > peer { 1 } else { 0 };
         Link {
             state: LinkState::default(),
-            so_table: SoTable::new(),
             counter: 0,
             turn_bit: bit,
             pending: None,
@@ -430,21 +332,6 @@ impl Link {
         self.ts = ts;
         self.pending = None;
         result
-    }
-
-    /// True if an SO instance is connected.
-    pub fn so_connected(&self, so_id: u64) -> bool {
-        self.so_table.get(so_id)
-            .map_or(false, |inst| inst.status == ConnectionStatus::Connected)
-    }
-
-    /// True if an SO instance is connected and the link is not closing.
-    pub fn so_available(&self, so_id: u64) -> bool {
-        if self.state.conn.intent_close {
-            return false;
-        }
-        self.so_table.get(so_id)
-            .map_or(false, |inst| inst.status == ConnectionStatus::Connected)
     }
 
     /// Finalize a received response to our outgoing message.

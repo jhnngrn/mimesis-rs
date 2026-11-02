@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::link::{
-    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg, SoInstance,
+    ConnectMode, ConnectionState, ConnectionStatus, Link, QueuedMsg,
     SyncError, TxRequest, ValidateResult, now_secs,
 };
 use crate::module::Module;
@@ -26,9 +26,6 @@ pub struct SoConfig {
     pub connect_mode: ConnectMode,
     /// Child module types that can exist under this one.
     pub children: Vec<String>,
-    /// Whether the framework creates an SoInstance (queue + ref count) on connect.
-    /// Modules with has_so=false get dispatch only — no queue, no SoInstance.
-    pub has_so: bool,
 }
 
 impl SoConfig {
@@ -36,7 +33,6 @@ impl SoConfig {
         SoConfig {
             connect_mode: ConnectMode::Auto,
             children: vec![],
-            has_so: true,
         }
     }
 
@@ -44,16 +40,6 @@ impl SoConfig {
         SoConfig {
             connect_mode: ConnectMode::Invite,
             children: vec![],
-            has_so: true,
-        }
-    }
-
-    /// Dispatch-only: module gets routed messages but no SoInstance/queue.
-    pub fn dispatch_only() -> Self {
-        SoConfig {
-            connect_mode: ConnectMode::Auto,
-            children: vec![],
-            has_so: false,
         }
     }
 
@@ -101,9 +87,6 @@ pub struct Node {
     /// Registered modules by name.
     #[serde(skip)]
     modules: HashMap<String, Arc<Mutex<dyn Module>>>,
-    /// Next SO instance ID to assign.
-    #[serde(default)]
-    next_so_id: u64,
     /// Framework-owned outbox registry (queues, kicks, ref counts).
     #[serde(skip)]
     registry: RegistryRef,
@@ -116,7 +99,6 @@ impl Node {
             links: HashMap::new(),
             so_types: HashMap::new(),
             modules: HashMap::new(),
-            next_so_id: 1, // 0 reserved for lifecycle
             registry: registry::new_registry(),
         }
     }
@@ -126,12 +108,11 @@ impl Node {
         self.so_types.insert(name.to_string(), config);
     }
 
-    /// Declare a root module with children but no SO (dispatch only).
-    /// The module gets on_connect/on_close and message routing,
-    /// but no SoInstance or queue is created by the framework.
+    /// Declare a root module with children.
+    /// The module gets on_connect/on_close and message routing.
     pub fn declare_root(&mut self, name: &str, children: Vec<String>) {
         self.so_types
-            .insert(name.to_string(), SoConfig::dispatch_only().with_children(children));
+            .insert(name.to_string(), SoConfig::auto().with_children(children));
     }
 
     /// Register a module instance.
@@ -145,11 +126,6 @@ impl Node {
     }
 
     /// Allocate a new bilateral SO instance ID.
-    fn alloc_so_id(&mut self) -> u64 {
-        let id = self.next_so_id;
-        self.next_so_id += 1;
-        id
-    }
 
     // -----------------------------------------------------------------------
     // Accessors
@@ -312,86 +288,11 @@ impl Node {
     // SO instance creation — SOs are pure data (queue + ref count)
     // -----------------------------------------------------------------------
 
-    /// Create a root SO instance on a link when it connects.
-    /// The SO is data only; the Module handles all logic.
-    fn create_root_so(&mut self, peer: &str, so_type: &str) {
-        let so_id = self.alloc_so_id();
-        // Register a queue in the registry for this SO instance.
-        self.registry
-            .lock()
-            .unwrap()
-            .register_so(peer, so_id, so_type);
-
-        let instance = SoInstance {
-            so_type: so_type.to_string(),
-            parent_id: None,
-            status: ConnectionStatus::Connected,
-            children: Default::default(),
-            so_children: Vec::new(),
-        };
-        if let Some(lk) = self.links.get_mut(peer) {
-            lk.so_table.insert(so_id, instance);
-        }
-    }
-
-    /// Create a modul-SO for a module. If has_so is true, creates a real
-    /// SyncObject with send/has_pending wired to the registry. Otherwise
-    /// returns a zero-value SyncObject (no-op send/has_pending).
+    /// Create a modul-SO for a module. Creates a SyncObject with
+    /// send/has_pending wired to the registry.
     /// The module owns the returned SO — Drop auto-unregisters.
     fn create_module_so(&self, peer: &str, module_name: &str) -> crate::sync_object::SyncObject<()> {
-        if self.so_types.get(module_name).map_or(false, |c| c.has_so) {
-            crate::sync_object::SyncObject::new((), peer, &self.registry, module_name)
-        } else {
-            crate::sync_object::SyncObject::without_registry((), peer)
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Pending child finalization — assign so_id = counter after transaction
-    // -----------------------------------------------------------------------
-
-    /// After a successful transaction, assign so_id to any pending child
-    /// that was in Waiting state (sent but not yet confirmed).
-    /// Both sender and receiver call this with the same counter value,
-    /// so both sides derive the same child so_id.
-    fn finalize_pending_children(&mut self, peer: &str, tx_counter: u64) {
-        if let Some(lk) = self.links.get_mut(peer) {
-            for inst in lk.so_table.instances.values_mut() {
-                for child in inst.so_children.iter_mut() {
-                    if child.so_id.is_none()
-                        && child.status == Some(ConnectionStatus::Waiting)
-                    {
-                        child.so_id = Some(tx_counter);
-                        child.status = Some(ConnectionStatus::Connected);
-                        return; // one at a time
-                    }
-                }
-            }
-        }
-    }
-
-    /// Handle NACK on a pending child create message.
-    /// - Auto: remove the child (shouldn't have been NACKed)
-    /// - Invite/Closed: keep in Waiting (mutual-add / accept flow)
-    fn handle_nacked_children(&mut self, peer: &str) {
-        let so_types = &self.so_types;
-        if let Some(lk) = self.links.get_mut(peer) {
-            for inst in lk.so_table.instances.values_mut() {
-                inst.so_children.retain(|child| {
-                    if child.so_id.is_none()
-                        && child.status == Some(ConnectionStatus::Waiting)
-                    {
-                        let mode = so_types
-                            .get(&child.so_type)
-                            .map_or(ConnectMode::Auto, |cfg| cfg.connect_mode);
-                        // Auto → remove; Invite/Closed → keep in Waiting
-                        mode != ConnectMode::Auto
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
+        crate::sync_object::SyncObject::new((), peer, &self.registry, module_name)
     }
 
     // -----------------------------------------------------------------------
@@ -408,12 +309,6 @@ impl Node {
         }
         for cs in lk.state.modules.values() {
             if cs.children.has_connected() {
-                return true;
-            }
-        }
-        // Also check SO table.
-        for inst in lk.so_table.instances.values() {
-            if inst.children.has_connected() {
                 return true;
             }
         }
@@ -451,33 +346,16 @@ impl Node {
     // -----------------------------------------------------------------------
 
     /// Dispatch an incoming sync request.
-    /// Routes by so_id for SO instance messages, by namespace for legacy.
+    /// Routes by namespace prefix (like Go).
     /// Returns tristate i8: 1 = ack, 0 = nack, -1 = error.
     pub fn dispatch_request(
         &mut self,
         peer: &str,
-        so_id: u64,
+        _so_id: u64,
         full_method: &str,
         payload: Option<Value>,
         ts: i64,
     ) -> Result<i8, SyncError> {
-        // SO-id based routing: if so_id > 0, route to Module by SO type.
-        if so_id > 0 {
-            let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
-            if !lk.so_connected(so_id) {
-                return Err(SyncError::BadMethod);
-            }
-            let so_type = lk.so_table.get(so_id)
-                .map(|inst| inst.so_type.clone())
-                .ok_or(SyncError::BadMethod)?;
-            let m = self.modules.get(&so_type).ok_or(SyncError::BadMethod)?;
-            match m.lock().unwrap().handle_request(peer, full_method, payload, ts) {
-                Ok(result) => return Ok(result),
-                Err(e) => return Err(SyncError::Other(e.to_string())),
-            }
-        }
-
-        // Legacy namespace-based routing for lifecycle and old-style modules.
         let (ns, method) = split_method(full_method);
 
         if ns == "link" {
@@ -486,7 +364,7 @@ impl Node {
         if ns == "module" {
             return self.dispatch_module_request(peer, method, payload, ts);
         }
-        // Application module message (legacy).
+        // Application module message.
         let lk = self.links.get(peer).ok_or(SyncError::NoLink)?;
         if !lk.module_connected(ns) {
             return Err(SyncError::BadMethod);
@@ -536,9 +414,6 @@ impl Node {
                     let lk = self.links.get_mut(peer).unwrap();
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
-                    if self.so_types.get(&root).map_or(false, |c| c.has_so) {
-                        self.create_root_so(peer, &root);
-                    }
                     // Notify module with modul-SO.
                     let so = self.create_module_so(peer, &root);
                     if let Some(m) = self.modules.get(root.as_str()) {
@@ -698,20 +573,6 @@ impl Node {
         payload: Option<Value>,
         result: i8,
     ) {
-        // SO-id based routing: route to Module by SO type.
-        if so_id > 0 {
-            let so_type = self.links.get(peer)
-                .and_then(|lk| lk.so_table.get(so_id))
-                .map(|inst| inst.so_type.clone());
-            if let Some(so_type) = so_type {
-                if let Some(m) = self.modules.get(&so_type) {
-                    m.lock().unwrap().handle_response(peer, full_method, payload, result);
-                }
-            }
-            return;
-        }
-
-        // Legacy namespace-based routing.
         let (ns, method) = split_method(full_method);
         if ns == "link" {
             self.dispatch_link_response(peer, method, payload, result);
@@ -744,9 +605,6 @@ impl Node {
                     // Set state to Connected.
                     lk.state.conn.status = Some(ConnectionStatus::Connected);
                     lk.state.conn.intent_connect = false;
-                    if self.so_types.get(&root).map_or(false, |c| c.has_so) {
-                        self.create_root_so(peer, &root);
-                    }
                     // Notify module with modul-SO.
                     let so = self.create_module_so(peer, &root);
                     if let Some(m) = self.modules.get(root.as_str()) {
@@ -932,16 +790,9 @@ impl Node {
                     self.registry.lock().unwrap().dequeue(pending_queue_id);
                 }
 
-                let piggybacked_counter = {
+                {
                     let lk = self.links.get_mut(&peer).unwrap();
-                    let counter = lk.counter;
                     lk.accept_response();
-                    counter
-                };
-                if resp > 0 {
-                    self.finalize_pending_children(&peer, piggybacked_counter);
-                } else {
-                    self.handle_nacked_children(&peer);
                 }
             }
         }
@@ -965,16 +816,10 @@ impl Node {
         // Dispatch request with so_id.
         let result = self.dispatch_request(&peer, env.so_id, &env.method, env.payload.clone(), ts)?;
 
-        let (tx_counter, response) = {
+        let response = {
             let lk = self.links.get_mut(&peer).unwrap();
-            let counter = lk.counter;
-            let response = lk.accept_request(result, ts);
-            (counter, response)
+            lk.accept_request(result, ts)
         };
-
-        if response > 0 {
-            self.finalize_pending_children(&peer, tx_counter);
-        }
 
         Ok(response)
     }
@@ -1013,15 +858,7 @@ impl Node {
         if lk.state.conn.intent_close
             && lk.state.conn.status == Some(ConnectionStatus::Connected)
         {
-            // Close SO instances first.
-            for (_, inst) in &lk.so_table.instances {
-                if inst.status == ConnectionStatus::Connected
-                    && !inst.children.has_connected()
-                {
-                    // TODO: emit SO close message
-                }
-            }
-            // Close legacy modules.
+            // Close modules.
             for (name, mod_state) in &lk.state.modules {
                 if mod_state.status == Some(ConnectionStatus::Connected)
                     && !mod_state.children.has_connected()
@@ -1121,54 +958,13 @@ impl Node {
             });
         }
 
-        // Pending child SO creates — children with so_id: None, status: None.
-        // Emit message with PARENT's so_id (routes to parent on receiver).
-        // Child's so_id = counter, derived after the transaction succeeds.
-        {
-            let lk = self.links.get_mut(peer)?;
-            for (&parent_so_id, inst) in lk.so_table.instances.iter_mut() {
-                for child in inst.so_children.iter_mut() {
-                    if child.so_id.is_none() && child.status.is_none() {
-                        child.status = Some(ConnectionStatus::Waiting);
-                        return Some(QueuedMsg {
-                            so_id: parent_so_id,
-                            method: child.method.clone(),
-                            payload: child.payload.clone(),
-                            queued_at: 0,
-                            queue_id: 0,
-                            timestamp: 0,
-                        });
-                    }
-                }
-            }
-        }
         let lk = self.links.get(peer)?;
 
         // Collect from registry outboxes — oldest entry wins.
         let reg = self.registry.lock().unwrap();
         let mut best: Option<QueuedMsg> = None;
 
-        // SO-instance queues (new system).
-        for (&so_id, inst) in &lk.so_table.instances {
-            if inst.status != ConnectionStatus::Connected {
-                continue;
-            }
-            for candidate in reg.collect_outbox_by_so(so_id, peer) {
-                let msg = QueuedMsg {
-                    so_id,
-                    method: candidate.method,
-                    payload: candidate.payload,
-                    queued_at: candidate.queued_at,
-                    queue_id: candidate.queue_id,
-                    timestamp: 0,
-                };
-                if is_older(&msg, &best) {
-                    best = Some(msg);
-                }
-            }
-        }
-
-        // Legacy module queues (namespace-routed).
+        // Module queues (namespace-routed).
         let connected_modules: Vec<String> = self
             .modules
             .keys()
@@ -1388,290 +1184,4 @@ mod tests {
         assert!(node.get("bob@b.com").is_none());
     }
 
-    #[test]
-    fn so_instance_created_on_connect() {
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so("trustline", SoConfig::auto());
-        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-        alice.connect("bob@b.com", "trustline").unwrap();
-
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com").unwrap();
-
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-
-        let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp > 0);
-
-        // Bob should have a root SO instance in the table (data only, no handler).
-        let bob_lk = bob.get("alice@a.com").unwrap();
-        assert_eq!(bob_lk.so_table.instances.len(), 1);
-        let (_, inst) = bob_lk.so_table.root().unwrap();
-        assert_eq!(inst.so_type, "trustline");
-        assert_eq!(inst.status, ConnectionStatus::Connected);
-    }
-
-    #[test]
-    fn pending_child_routes_via_parent_so_id() {
-        use crate::link::SoChild;
-
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-
-        // Connect alice → bob.
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_root("trustline", vec![]);
-        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-        alice.connect("bob@b.com", "trustline").unwrap();
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com").unwrap();
-        let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp > 0);
-
-        // Get root SO id on bob.
-        let root_so_id = {
-            let lk = bob.get("alice@a.com").unwrap();
-            let (id, _) = lk.so_table.root().unwrap();
-            id
-        };
-
-        // Add a pending child (so_id: None, status: None) to the root SO.
-        {
-            let lk = bob.get_mut("alice@a.com").unwrap();
-            let root = lk.so_table.get_mut(root_so_id).unwrap();
-            root.so_children.push(SoChild {
-                so_id: None,
-                so_type: "novation".into(),
-                status: None,
-                method: "commit".into(),
-                payload: Some(serde_json::json!({"amount": 100})),
-            });
-        }
-
-        // next_tx should pick up the pending child.
-        // The message should use PARENT's so_id (not allocate a new one).
-        let next = bob.next_tx("alice@a.com");
-        assert!(next.is_some());
-        let next = next.unwrap();
-        assert_eq!(next.method, "commit");
-        assert_eq!(next.so_id, root_so_id, "creating message routes via parent's so_id");
-
-        // The child should still have so_id: None but status: Waiting.
-        let lk = bob.get("alice@a.com").unwrap();
-        let root = lk.so_table.get(root_so_id).unwrap();
-        let child = &root.so_children[0];
-        assert!(child.so_id.is_none(), "so_id not assigned yet — derived from counter after tx");
-        assert_eq!(child.status, Some(ConnectionStatus::Waiting));
-    }
-
-    #[test]
-    fn child_so_id_equals_counter_after_transaction() {
-        use crate::link::SoChild;
-
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so("trustline", SoConfig::auto());
-        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-        alice.connect("bob@b.com", "trustline").unwrap();
-
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-
-        // Bilateral connect.
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com").unwrap();
-        let resp = bob.handle_incoming(&env).unwrap();
-        assert!(resp > 0);
-        {
-        }
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response();
-        }
-
-        // Get root SO id on alice.
-        let root_so_id = {
-            let lk = alice.get("bob@b.com").unwrap();
-            let (id, _) = lk.so_table.root().unwrap();
-            id
-        };
-
-        // Add a pending child on alice.
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            let root = lk.so_table.get_mut(root_so_id).unwrap();
-            root.so_children.push(SoChild {
-                so_id: None,
-                so_type: "novation".into(),
-                status: None,
-                method: "commit".into(),
-                payload: Some(serde_json::json!({"amount": 100})),
-            });
-        }
-
-        // next_tx emits the creating message with parent's so_id.
-        let creating_msg = alice.next_tx("bob@b.com").unwrap();
-        assert_eq!(creating_msg.so_id, root_so_id);
-        assert_eq!(creating_msg.method, "commit");
-
-        // Record the counter BEFORE the transaction.
-        let tx_counter = alice.get("bob@b.com").unwrap().counter;
-
-        // Build and send to bob.
-        alice.promote_pending("bob@b.com", creating_msg.clone());
-        let env = alice.build_request("bob@b.com").unwrap();
-
-        // Bob receives — handle_incoming calls finalize_pending_children.
-        // Bob's parent handler gets the request but doesn't create a child
-        // (that's app-level logic, not tested here). The receiver-side
-        // finalization only fires if the receiver also has a pending child.
-        let bob_resp = bob.handle_incoming(&env).unwrap();
-        assert!(bob_resp > 0);
-
-        // Alice processes the response — finalize_pending_children assigns
-        // child.so_id = tx_counter.
-        alice.dispatch_response(
-            "bob@b.com",
-            creating_msg.so_id,
-            &creating_msg.method,
-            creating_msg.payload,
-            bob_resp,
-        );
-        // Simulate accept_response + finalize (normally in handle_incoming
-        // for piggybacked responses, here we do it manually).
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response();
-        }
-        // Call finalize manually since we're outside handle_incoming.
-        alice.finalize_pending_children("bob@b.com", tx_counter);
-
-        // Verify: child.so_id = tx_counter.
-        let lk = alice.get("bob@b.com").unwrap();
-        let root = lk.so_table.get(root_so_id).unwrap();
-        let child = &root.so_children[0];
-        assert_eq!(child.so_id, Some(tx_counter), "child so_id should equal the transaction counter");
-        assert_eq!(child.status, Some(ConnectionStatus::Connected));
-    }
-
-    #[test]
-    fn nack_removes_auto_child() {
-        use crate::link::SoChild;
-
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so("trustline", SoConfig::auto());
-        alice.declare_so("novation", SoConfig::auto()); // Auto mode
-        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-        alice.connect("bob@b.com", "trustline").unwrap();
-
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-
-        // Bilateral connect.
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com").unwrap();
-        let resp = bob.handle_incoming(&env).unwrap();
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response();
-        }
-
-        let root_so_id = {
-            let lk = alice.get("bob@b.com").unwrap();
-            let (id, _) = lk.so_table.root().unwrap();
-            id
-        };
-
-        // Add pending child.
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            let root = lk.so_table.get_mut(root_so_id).unwrap();
-            root.so_children.push(SoChild {
-                so_id: None,
-                so_type: "novation".into(),
-                status: None,
-                method: "commit".into(),
-                payload: None,
-            });
-        }
-
-        // next_tx picks it up → status becomes Waiting.
-        let creating_msg = alice.next_tx("bob@b.com").unwrap();
-        assert_eq!(creating_msg.method, "commit");
-
-        // Simulate NACK.
-        alice.handle_nacked_children("bob@b.com");
-
-        // Auto mode → child should be removed.
-        let lk = alice.get("bob@b.com").unwrap();
-        let root = lk.so_table.get(root_so_id).unwrap();
-        assert!(root.so_children.is_empty(), "Auto child should be removed on NACK");
-    }
-
-    #[test]
-    fn nack_keeps_invite_child() {
-        use crate::link::SoChild;
-
-        let mut alice = Node::new("alice@a.com".into());
-        alice.declare_so("trustline", SoConfig::auto());
-        alice.declare_so("payment", SoConfig::invite()); // Invite mode
-        alice.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-        alice.connect("bob@b.com", "trustline").unwrap();
-
-        let mut bob = Node::new("bob@b.com".into());
-        bob.declare_so("trustline", SoConfig::auto());
-        bob.register_module("trustline", Arc::new(Mutex::new(TestModule::new())));
-
-        // Bilateral connect.
-        let msg = alice.next_tx("bob@b.com").unwrap();
-        alice.promote_pending("bob@b.com", msg.clone());
-        let env = alice.build_request("bob@b.com").unwrap();
-        let resp = bob.handle_incoming(&env).unwrap();
-        alice.dispatch_response("bob@b.com", msg.so_id, &msg.method, msg.payload, resp);
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            lk.accept_response();
-        }
-
-        let root_so_id = {
-            let lk = alice.get("bob@b.com").unwrap();
-            let (id, _) = lk.so_table.root().unwrap();
-            id
-        };
-
-        // Add pending child with Invite-mode type.
-        {
-            let lk = alice.get_mut("bob@b.com").unwrap();
-            let root = lk.so_table.get_mut(root_so_id).unwrap();
-            root.so_children.push(SoChild {
-                so_id: None,
-                so_type: "payment".into(),
-                status: None,
-                method: "request".into(),
-                payload: None,
-            });
-        }
-
-        // next_tx picks it up → status becomes Waiting.
-        alice.next_tx("bob@b.com").unwrap();
-
-        // Simulate NACK.
-        alice.handle_nacked_children("bob@b.com");
-
-        // Invite mode → child should stay in Waiting.
-        let lk = alice.get("bob@b.com").unwrap();
-        let root = lk.so_table.get(root_so_id).unwrap();
-        assert_eq!(root.so_children.len(), 1, "Invite child should stay on NACK");
-        assert_eq!(root.so_children[0].status, Some(ConnectionStatus::Waiting));
-    }
 }
